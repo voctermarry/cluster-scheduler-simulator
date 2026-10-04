@@ -14,7 +14,7 @@ from .policies import (
     select_node,
     taint_predicate,
 )
-from .simulator import Simulation, SimulationResult, compare_policies, replay, simulate
+from .simulator import Simulation, SimulationResult, compare_policies, replay, simulate, validate_queue_weights
 
 __all__ = [
     "Cluster",
@@ -42,6 +42,7 @@ __all__ = [
     "select_node",
     "simulate",
     "taint_predicate",
+    "validate_queue_weights",
 ]
 
 __version__ = "0.1.0"

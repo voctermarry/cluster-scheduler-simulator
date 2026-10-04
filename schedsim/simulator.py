@@ -11,11 +11,26 @@ exactly once per placement, tracked by index.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from .errors import ValidationError
 from .model import Cluster, Node, Placement, Task
 from .policies import POLICIES, fragmentation, preemption_candidates, select_node
+
+
+def validate_queue_weights(weights: Mapping[str, int]) -> dict[str, int]:
+    """The one place queue-weight rules live, so the CLI file format and the Python mapping agree."""
+    if not isinstance(weights, Mapping) or not weights:
+        raise ValidationError("queue weights must be a non-empty mapping of queue name to positive integer")
+    clean: dict[str, int] = {}
+    for queue, weight in weights.items():
+        if not isinstance(queue, str) or not queue:
+            raise ValidationError("queue names must be non-empty strings", value=queue)
+        if isinstance(weight, bool) or not isinstance(weight, int) or weight <= 0:
+            raise ValidationError("queue weights must be positive integers", queue=queue, value=weight)
+        clean[queue] = int(weight)
+    return clean
 
 
 @dataclass(slots=True)
@@ -49,13 +64,17 @@ class Simulation:
     policy: str = "first-fit"
     allow_preemption: bool = False
     backfill: bool = True
+    queue_weights: Mapping[str, int] | None = None
     _cluster: Cluster = field(init=False)
     _placements: list[Placement] = field(default_factory=list, init=False)
     _released: set[int] = field(default_factory=set, init=False)
     _decisions: list[dict[str, object]] = field(default_factory=list, init=False)
     _preemptions: int = field(default=0, init=False)
     _waits: list[int] = field(default_factory=list, init=False)
+    _wait_by_task: dict[str, int] = field(default_factory=dict, init=False)
     _last_refusal: dict[str, str] = field(default_factory=dict, init=False)
+    _fair: bool = field(init=False)
+    _weights: dict[str, int] = field(init=False)
 
     def __post_init__(self) -> None:
         if self.policy not in POLICIES:
@@ -63,6 +82,8 @@ class Simulation:
         ids = [task.id for task in self.tasks]
         if len(set(ids)) != len(ids):
             raise ValidationError("task ids must be unique")
+        self._fair = self.queue_weights is not None
+        self._weights = validate_queue_weights(self.queue_weights) if self._fair else {}
         self._cluster = Cluster(self.nodes)
 
     # -- bookkeeping -----------------------------------------------------------------------------
@@ -72,6 +93,49 @@ class Simulation:
 
     def _pending_order(self, pending: list[Task]) -> list[Task]:
         return sorted(pending, key=lambda task: (-task.priority, task.arrival, task.id))
+
+    # -- fair share ------------------------------------------------------------------------------
+    def _weight(self, queue: str) -> int:
+        """Queues the tasks use but the config never declares weigh 1."""
+        return self._weights.get(queue, 1)
+
+    def _queue_shares(self, clock: int) -> dict[str, float]:
+        """Weighted dominant share per queue, from what is running right now.
+
+        The dominant share is the larger of the queue's CPU fraction and memory fraction of the
+        whole cluster; dividing by the queue's weight is what makes the schedule *fair* rather
+        than merely proportional. Recomputed on every call, so a placement, preemption or release
+        is reflected in the very next ordering.
+        """
+        total = self._cluster.total_capacity()
+        cpu_used: dict[str, int] = {}
+        memory_used: dict[str, int] = {}
+        for item in self._active(clock):
+            task = self.task_index[item.task_id]
+            cpu_used[task.queue] = cpu_used.get(task.queue, 0) + task.request.cpu
+            memory_used[task.queue] = memory_used.get(task.queue, 0) + task.request.memory
+        shares: dict[str, float] = {}
+        for queue in set(cpu_used) | set(memory_used):
+            cpu_share = cpu_used.get(queue, 0) / total.cpu if total.cpu else 0.0
+            memory_share = memory_used.get(queue, 0) / total.memory if total.memory else 0.0
+            shares[queue] = max(cpu_share, memory_share) / self._weight(queue)
+        return shares
+
+    def _fair_order(self, pending: list[Task], clock: int) -> list[Task]:
+        shares = self._queue_shares(clock)
+        return sorted(
+            pending,
+            key=lambda task: (-task.priority, shares.get(task.queue, 0.0), task.arrival, task.queue, task.id),
+        )
+
+    def _fair_fields(self, task: Task, clock: int) -> dict[str, object]:
+        if not self._fair:
+            return {}
+        return {
+            "queue": task.queue,
+            "weight": self._weight(task.queue),
+            "weightedDominantShare": round(self._queue_shares(clock).get(task.queue, 0.0), 6),
+        }
 
     def _active(self, clock: int) -> list[Placement]:
         return [item for item in self._placements if item.start <= clock < item.end]
@@ -97,6 +161,7 @@ class Simulation:
         self._cluster.occupy(node_id, task.request)
         self._placements.append(Placement(task.id, node_id, clock, clock + task.duration, preempted))
         self._waits.append(clock - task.arrival)
+        self._wait_by_task[task.id] = clock - task.arrival
 
     # -- run -------------------------------------------------------------------------------------
     def run(self) -> SimulationResult:
@@ -119,18 +184,21 @@ class Simulation:
                 break
 
             progressed = False
-            for task in self._pending_order(waiting):
-                if self._try_place(task, clock):
-                    waiting.remove(task)
-                    progressed = True
-                    continue
-                if self.backfill:
-                    horizon = self._running_end(clock)
-                    if horizon is not None and clock + task.duration <= horizon and self._try_place(task, clock, backfill=True):
+            if self._fair:
+                progressed = self._fair_pass(waiting, clock)
+            else:
+                for task in self._pending_order(waiting):
+                    if self._try_place(task, clock):
                         waiting.remove(task)
                         progressed = True
                         continue
-                break  # the head of the queue is blocked; nothing behind it may jump the line
+                    if self.backfill:
+                        horizon = self._running_end(clock)
+                        if horizon is not None and clock + task.duration <= horizon and self._try_place(task, clock, backfill=True):
+                            waiting.remove(task)
+                            progressed = True
+                            continue
+                    break  # the head of the queue is blocked; nothing behind it may jump the line
 
             if not self._active(clock) and not not_arrived:
                 break
@@ -158,7 +226,30 @@ class Simulation:
             metrics=self._metrics(makespan, unplaced),
         )
 
-    def _record_refusal(self, task: Task, reason: str, clock: int) -> None:
+    def _fair_pass(self, waiting: list[Task], clock: int) -> bool:
+        """One fair-mode scheduling round: always reconsider the head, because shares move.
+
+        The queue order is recomputed before every attempt -- a placement, preemption or release
+        changes the weighted dominant shares, and the next task must be chosen against the new
+        shares. Head-of-line blocking and the conservative backfill boundary are unchanged.
+        """
+        progressed = False
+        while waiting:
+            task = self._fair_order(waiting, clock)[0]
+            if self._try_place(task, clock):
+                waiting.remove(task)
+                progressed = True
+                continue
+            if self.backfill:
+                horizon = self._running_end(clock)
+                if horizon is not None and clock + task.duration <= horizon and self._try_place(task, clock, backfill=True):
+                    waiting.remove(task)
+                    progressed = True
+                    continue
+            break  # the head of the queue is blocked; nothing behind it may jump the line
+        return progressed
+
+    def _record_refusal(self, task: Task, reason: str, clock: int, extra: dict[str, object] | None = None) -> None:
         """Append a refusal only when it differs from the previous one for this task.
 
         The scheduler retries the same blocked task at every tick, so logging each attempt verbatim
@@ -168,17 +259,21 @@ class Simulation:
         if previous == reason:
             return
         self._last_refusal[task.id] = reason
-        self._decisions.append({"task": task.id, "reason": reason, "at": clock})
+        decision: dict[str, object] = {"task": task.id, "reason": reason, "at": clock}
+        if extra:
+            decision.update(extra)
+        self._decisions.append(decision)
 
     def _try_place(self, task: Task, clock: int, backfill: bool = False) -> bool:
+        fair = self._fair_fields(task, clock)
         decision = select_node(self._cluster, task, self.policy)
         if decision.node_id is not None:
             self._place(task, decision.node_id, clock, ())
-            self._decisions.append({"task": task.id, "node": decision.node_id, "reason": "backfill" if backfill else decision.reason, "at": clock})
+            self._decisions.append({"task": task.id, "node": decision.node_id, "reason": "backfill" if backfill else decision.reason, "at": clock, **fair})
             self._last_refusal.pop(task.id, None)
             return True
         if not self.allow_preemption:
-            self._record_refusal(task, decision.reason, clock)
+            self._record_refusal(task, decision.reason, clock, fair)
             return False
         for node in sorted(self._cluster.nodes, key=lambda item: item.id):
             chosen, reason = preemption_candidates(self._cluster, task, node, self._placements, self.task_index, clock)
@@ -191,16 +286,16 @@ class Simulation:
                 self._released.add(index)
                 self._preemptions += 1
             self._place(task, node.id, clock, tuple(sorted(item.task_id for item in chosen)))
-            self._decisions.append({"task": task.id, "node": node.id, "reason": reason, "at": clock})
+            self._decisions.append({"task": task.id, "node": node.id, "reason": reason, "at": clock, **fair})
             self._last_refusal.pop(task.id, None)
             return True
-        self._record_refusal(task, decision.reason, clock)
+        self._record_refusal(task, decision.reason, clock, fair)
         return False
 
     def _metrics(self, makespan: int, unplaced: list[str]) -> dict[str, object]:
         total_cpu = self._cluster.total_capacity().cpu
         used_cpu_time = sum(self.task_index[item.task_id].request.cpu * (item.end - item.start) for item in self._placements)
-        return {
+        metrics: dict[str, object] = {
             "makespan": makespan,
             "placed": len(self._placements),
             "unplaced": len(unplaced),
@@ -210,6 +305,41 @@ class Simulation:
             "utilization": round(used_cpu_time / (total_cpu * makespan), 6) if total_cpu and makespan else 0.0,
             "fragmentation": fragmentation(self._cluster, {task.id: task for task in self.tasks if task.id in set(unplaced)}),
         }
+        if self._fair:
+            metrics["queues"] = self._queue_metrics(makespan, set(unplaced))
+        return metrics
+
+    def _queue_metrics(self, makespan: int, unplaced: set[str]) -> dict[str, object]:
+        """Per-queue rollup, reported for every declared queue and every queue the tasks use.
+
+        Resource time accumulates over actual running intervals, so a preempted task contributes
+        only up to its termination tick. `dominantShare` is the same weighted-dominant measure the
+        scheduler ordered by, taken over the whole makespan; a zero capacity or makespan yields 0.
+        """
+        total = self._cluster.total_capacity()
+        report: dict[str, object] = {}
+        queues = sorted(set(self._weights) | {task.queue for task in self.tasks})
+        for queue in queues:
+            weight = self._weight(queue)
+            task_ids = {task.id for task in self.tasks if task.queue == queue}
+            placements = [item for item in self._placements if item.task_id in task_ids]
+            waits = [self._wait_by_task[item.task_id] for item in placements]
+            cpu_time = sum(self.task_index[item.task_id].request.cpu * (item.end - item.start) for item in placements)
+            memory_time = sum(self.task_index[item.task_id].request.memory * (item.end - item.start) for item in placements)
+            if makespan and total.cpu and total.memory:
+                dominant = max(cpu_time / (total.cpu * makespan), memory_time / (total.memory * makespan)) / weight
+            else:
+                dominant = 0.0
+            report[queue] = {
+                "weight": weight,
+                "placed": len(placements),
+                "unplaced": len(task_ids & unplaced),
+                "averageWait": round(sum(waits) / len(waits), 3) if waits else 0.0,
+                "cpuTime": cpu_time,
+                "memoryTime": memory_time,
+                "dominantShare": round(dominant, 6),
+            }
+        return report
 
 
 def simulate(nodes: tuple[Node, ...], tasks: tuple[Task, ...], **options: object) -> SimulationResult:
@@ -241,14 +371,15 @@ def compare_policies(
     results: list[dict[str, object]] = []
     for policy in policies:
         result = simulate(nodes, tasks, policy=policy, **options)
-        results.append(
-            {
-                "policy": policy,
-                "makespan": result.makespan,
-                "placed": len(result.placements),
-                "unplaced": len(result.unplaced),
-                "averageWait": result.metrics["averageWait"],
-                "utilization": result.metrics["utilization"],
-            }
-        )
+        entry: dict[str, object] = {
+            "policy": policy,
+            "makespan": result.makespan,
+            "placed": len(result.placements),
+            "unplaced": len(result.unplaced),
+            "averageWait": result.metrics["averageWait"],
+            "utilization": result.metrics["utilization"],
+        }
+        if "queues" in result.metrics:
+            entry["queues"] = result.metrics["queues"]
+        results.append(entry)
     return {"policies": results}

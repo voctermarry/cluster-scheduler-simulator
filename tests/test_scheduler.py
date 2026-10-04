@@ -240,5 +240,92 @@ class SimulationTests(unittest.TestCase):
             simulate(nodes(), (task("a"),), policy="round-robin")
 
 
+class FairShareTests(unittest.TestCase):
+    def test_equal_priority_prefers_the_queue_with_the_smaller_share(self) -> None:
+        cluster_nodes = (Node("n1", Resources(4, 4)),)
+        tasks = (
+            task("a1", cpu=2, memory=2, queue="a", duration=4),
+            task("b1", cpu=2, memory=2, queue="b", duration=4),
+            task("a2", cpu=2, memory=2, queue="a", duration=2),
+            task("b2", cpu=2, memory=2, queue="b", duration=2),
+        )
+        weights = {"a": 1, "b": 2}
+        result = simulate(cluster_nodes, tasks, queue_weights=weights)
+        starts = {item.task_id: item.start for item in result.placements}
+        # Once a1 is running, queue a's share (0.5) exceeds b's (0), so b1 goes next -- not a2.
+        self.assertEqual(starts["b1"], 0)
+        self.assertEqual(starts["a2"], 4)
+        default = simulate(cluster_nodes, tasks)
+        default_starts = {item.task_id: item.start for item in default.placements}
+        self.assertEqual(default_starts["a2"], 0)
+
+    def test_undeclared_queues_weigh_one(self) -> None:
+        cluster_nodes = (Node("n1", Resources(2, 2)),)
+        tasks = (task("x", cpu=2, memory=2, queue="mystery", duration=2),)
+        result = simulate(cluster_nodes, tasks, queue_weights={"declared": 3})
+        self.assertEqual(result.metrics["queues"]["mystery"]["weight"], 1)
+        self.assertEqual(result.metrics["queues"]["declared"]["placed"], 0)
+
+    def test_decisions_carry_queue_weight_and_share(self) -> None:
+        cluster_nodes = (Node("n1", Resources(2, 2)),)
+        tasks = (task("a", cpu=2, memory=2, queue="q", duration=1),)
+        result = simulate(cluster_nodes, tasks, queue_weights={"q": 4})
+        placed = [entry for entry in result.decisions if entry.get("node")]
+        self.assertEqual(placed[0]["queue"], "q")
+        self.assertEqual(placed[0]["weight"], 4)
+        self.assertEqual(placed[0]["weightedDominantShare"], 0.0)
+
+    def test_queue_metrics_accumulate_over_running_intervals(self) -> None:
+        cluster_nodes = (Node("n1", Resources(4, 4)),)
+        tasks = (
+            task("a", cpu=2, memory=2, queue="q", duration=2),
+            task("b", cpu=2, memory=2, queue="q", duration=2, arrival=2),
+        )
+        result = simulate(cluster_nodes, tasks, queue_weights={"q": 2})
+        queues = result.metrics["queues"]["q"]
+        self.assertEqual(queues["cpuTime"], 8)
+        self.assertEqual(queues["memoryTime"], 8)
+        self.assertEqual(queues["placed"], 2)
+        self.assertEqual(queues["unplaced"], 0)
+        # makespan 4, capacity 4: dominant share = (8 / (4*4)) / weight 2 = 0.25
+        self.assertEqual(queues["dominantShare"], 0.25)
+
+    def test_preempted_tasks_count_only_until_termination(self) -> None:
+        cluster_nodes = (Node("n1", Resources(2, 2)),)
+        tasks = (
+            task("low", cpu=2, memory=2, priority=1, queue="q", duration=10),
+            task("high", cpu=2, memory=2, priority=9, queue="q", duration=1, arrival=1),
+        )
+        result = simulate(cluster_nodes, tasks, queue_weights={"q": 1}, allow_preemption=True)
+        self.assertEqual(result.metrics["queues"]["q"]["cpuTime"], 2 * 1 + 2 * 1)
+
+    def test_zero_makespan_yields_zero_dominant_share(self) -> None:
+        result = simulate((Node("n1", Resources(1, 1)),), (task("huge", cpu=9, queue="q"),), queue_weights={"q": 1})
+        self.assertEqual(result.metrics["queues"]["q"]["dominantShare"], 0.0)
+        self.assertEqual(result.metrics["queues"]["q"]["unplaced"], 1)
+
+    def test_fair_replay_is_identical(self) -> None:
+        report = replay(nodes(), (task("a", cpu=1, queue="x"), task("b", cpu=2, queue="y")), queue_weights={"x": 1, "y": 2})
+        self.assertTrue(report["identical"])
+
+    def test_compare_policies_reports_queue_metrics(self) -> None:
+        report = compare_policies(nodes(), (task("a", cpu=1, queue="x"),), queue_weights={"x": 1})
+        for entry in report["policies"]:
+            self.assertIn("x", entry["queues"])
+
+    def test_invalid_weights_are_rejected(self) -> None:
+        for bad in ({}, {"q": 0}, {"q": -1}, {"q": True}, {"q": "1"}, {"": 1}):
+            with self.assertRaises(ValidationError, msg=repr(bad)):
+                simulate(nodes(), (task("a"),), queue_weights=bad)
+
+    def test_no_weights_keeps_the_default_schedule_and_metrics(self) -> None:
+        cluster_nodes = (Node("n1", Resources(4, 4)),)
+        tasks = (task("a", cpu=2, memory=2, queue="q", duration=2), task("b", cpu=2, memory=2, duration=2))
+        result = simulate(cluster_nodes, tasks)
+        self.assertNotIn("queues", result.metrics)
+        for entry in result.decisions:
+            self.assertNotIn("weightedDominantShare", entry)
+
+
 if __name__ == "__main__":
     unittest.main()

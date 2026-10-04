@@ -171,5 +171,111 @@ class CLITests(unittest.TestCase):
         self.assertEqual(len(refusals), 1)
 
 
+class QueueWeightsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.cluster = self.write("cluster.jsonl", [{"id": "n1", "cpu": 4, "memory": 4}])
+        self.tasks = self.write(
+            "tasks.jsonl",
+            [
+                {"id": "a1", "cpu": 2, "memory": 2, "queue": "a", "duration": 4},
+                {"id": "b1", "cpu": 2, "memory": 2, "queue": "b", "duration": 4},
+                {"id": "a2", "cpu": 2, "memory": 2, "queue": "a", "duration": 2},
+            ],
+        )
+        self.weights = self.write("weights.jsonl", [{"queue": "a", "weight": 1}, {"queue": "b", "weight": 2}])
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def write(self, name: str, rows: list[dict]) -> str:
+        path = os.path.join(self.directory.name, name)
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            for row in rows:
+                handle.write(json.dumps(row) + "\n")
+        return path
+
+    def write_raw(self, name: str, text: str) -> str:
+        path = os.path.join(self.directory.name, name)
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+        return path
+
+    def test_fair_mode_changes_the_order_and_reports_queues(self) -> None:
+        code, out, _ = run_cli(["simulate", "--cluster", self.cluster, "--tasks", self.tasks, "--queue-weights", self.weights])
+        self.assertEqual(code, EXIT_OK)
+        document = json.loads(out)
+        starts = {item["task"]: item["start"] for item in document["placements"]}
+        self.assertEqual(starts["b1"], 0)  # queue b is under its share once a1 runs
+        queues = document["metrics"]["queues"]
+        self.assertEqual(sorted(queues), ["a", "b"])
+        self.assertEqual(queues["b"]["weight"], 2)
+
+    def test_trace_decisions_carry_share_fields(self) -> None:
+        code, out, _ = run_cli(["trace", "--cluster", self.cluster, "--tasks", self.tasks, "--queue-weights", self.weights])
+        self.assertEqual(code, EXIT_OK)
+        placed = [entry for entry in json.loads(out)["decisions"] if entry.get("node")]
+        self.assertTrue(placed)
+        for entry in placed:
+            self.assertIn("queue", entry)
+            self.assertIn("weight", entry)
+            self.assertIn("weightedDominantShare", entry)
+
+    def test_metrics_and_policies_and_replay_accept_weights(self) -> None:
+        for command in ("metrics", "policies", "replay"):
+            code, out, err = run_cli([command, "--cluster", self.cluster, "--tasks", self.tasks, "--queue-weights", self.weights])
+            self.assertEqual((code, err), (EXIT_OK, ""), command)
+        self.assertIn("queues", json.loads(run_cli(["metrics", "--cluster", self.cluster, "--tasks", self.tasks, "--queue-weights", self.weights])[1])["metrics"])
+        report = json.loads(run_cli(["policies", "--cluster", self.cluster, "--tasks", self.tasks, "--queue-weights", self.weights])[1])
+        self.assertTrue(all("queues" in entry for entry in report["policies"]))
+        self.assertTrue(json.loads(run_cli(["replay", "--cluster", self.cluster, "--tasks", self.tasks, "--queue-weights", self.weights])[1])["identical"])
+
+    def test_without_weights_nothing_changes(self) -> None:
+        code, out, _ = run_cli(["metrics", "--cluster", self.cluster, "--tasks", self.tasks])
+        self.assertEqual(code, EXIT_OK)
+        self.assertNotIn("queues", json.loads(out)["metrics"])
+
+    def test_unreadable_weights_are_a_validation_error(self) -> None:
+        missing = os.path.join(self.directory.name, "missing.jsonl")
+        code, out, err = run_cli(["simulate", "--cluster", self.cluster, "--tasks", self.tasks, "--queue-weights", missing])
+        self.assertEqual((code, out), (EXIT_ERROR, ""))
+        self.assertEqual(json.loads(err)["error"], "validation_error")
+
+    def test_empty_weights_are_a_validation_error(self) -> None:
+        empty = self.write_raw("empty.jsonl", "# only a comment\n")
+        code, _, err = run_cli(["simulate", "--cluster", self.cluster, "--tasks", self.tasks, "--queue-weights", empty])
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertEqual(json.loads(err)["error"], "validation_error")
+
+    def test_duplicate_queue_is_a_validation_error(self) -> None:
+        duplicate = self.write("dup.jsonl", [{"queue": "a", "weight": 1}, {"queue": "a", "weight": 2}])
+        code, _, err = run_cli(["simulate", "--cluster", self.cluster, "--tasks", self.tasks, "--queue-weights", duplicate])
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertEqual(json.loads(err)["error"], "validation_error")
+
+    def test_non_positive_weight_is_a_validation_error(self) -> None:
+        zero = self.write("zero.jsonl", [{"queue": "a", "weight": 0}])
+        code, _, err = run_cli(["simulate", "--cluster", self.cluster, "--tasks", self.tasks, "--queue-weights", zero])
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertEqual(json.loads(err)["error"], "validation_error")
+
+    def test_broken_weights_report_the_line_number(self) -> None:
+        cases = {
+            "badjson.jsonl": '{"queue": "a", "weight": 1}\nnot json\n',
+            "notobject.jsonl": '["a", 1]\n',
+            "missing.jsonl": '{"queue": "a"}\n',
+            "badtype.jsonl": '{"queue": "a", "weight": "1"}\n',
+            "unknown.jsonl": '{"queue": "a", "weight": 1, "extra": true}\n',
+        }
+        for name, text in cases.items():
+            broken = self.write_raw(name, text)
+            code, out, err = run_cli(["simulate", "--cluster", self.cluster, "--tasks", self.tasks, "--queue-weights", broken])
+            self.assertEqual((code, out), (EXIT_ERROR, ""), name)
+            document = json.loads(err)
+            self.assertEqual(document["error"], "parse_error", name)
+            expected_line = 2 if name == "badjson.jsonl" else 1
+            self.assertEqual(document["line"], expected_line, name)
+
+
 if __name__ == "__main__":
     unittest.main()

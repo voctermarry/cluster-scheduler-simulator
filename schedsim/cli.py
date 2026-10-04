@@ -137,8 +137,44 @@ def load_tasks(path: str) -> tuple[Task, ...]:
     return tuple(tasks)
 
 
+def load_queue_weights(path: str) -> dict[str, int]:
+    """A JSONL file of {"queue": name, "weight": n} rows -- the fair-share configuration.
+
+    Shape problems (bad JSON, a non-object row, a missing/typed/unknown field) are parse errors
+    with the original line number; value problems (an unreadable or empty file, a repeated queue,
+    a non-positive weight) are validation errors. Both abort the command before anything runs.
+    """
+    weights: dict[str, int] = {}
+    for number, document in _rows(path, "queue weights"):
+        unknown = sorted(set(document) - {"queue", "weight"})
+        if unknown:
+            raise ParseError(f"queue weights line {number}: unknown field(s): {', '.join(unknown)}", line=number)
+        for name in ("queue", "weight"):
+            if name not in document:
+                raise ParseError(f"queue weights line {number}: missing {name}", line=number)
+        queue = document["queue"]
+        weight = document["weight"]
+        if not isinstance(queue, str):
+            raise ParseError(f"queue weights line {number}: queue must be a string", line=number)
+        if isinstance(weight, bool) or not isinstance(weight, int):
+            raise ParseError(f"queue weights line {number}: weight must be an integer", line=number)
+        if not queue:
+            raise ValidationError(f"queue weights line {number}: queue must be non-empty", line=number)
+        if weight <= 0:
+            raise ValidationError(f"queue weights line {number}: weight must be positive", line=number, value=weight)
+        if queue in weights:
+            raise ValidationError(f"queue weights line {number}: duplicate queue {queue!r}", line=number, value=queue)
+        weights[queue] = weight
+    if not weights:
+        raise ValidationError("the queue weights are empty", value=path)
+    return weights
+
+
 def _options(args: argparse.Namespace) -> dict[str, object]:
-    return {"policy": args.policy, "allow_preemption": args.preemption, "backfill": not args.no_backfill}
+    options: dict[str, object] = {"policy": args.policy, "allow_preemption": args.preemption, "backfill": not args.no_backfill}
+    if getattr(args, "queue_weights", None):
+        options["queue_weights"] = load_queue_weights(args.queue_weights)
+    return options
 
 
 # -- commands ------------------------------------------------------------------------------------
@@ -255,6 +291,7 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--policy", choices=list(POLICIES), default="first-fit")
         sub.add_argument("--preemption", action="store_true", help="allow higher priorities to evict lower ones")
         sub.add_argument("--no-backfill", action="store_true", help="disable conservative backfill")
+        sub.add_argument("--queue-weights", help="JSONL queue weights; enables weighted fair-share scheduling")
         return sub
 
     with_inputs("validate", "parse and validate both inputs").set_defaults(handler=_command_validate)

@@ -44,6 +44,26 @@ Unknown fields are rejected.
 
 Common options: `--policy first-fit|best-fit`, `--preemption`, `--no-backfill`, `--cluster -` for stdin.
 
+## Weighted fair share
+
+`simulate`, `trace`, `metrics`, `policies` and `replay` accept `--queue-weights weights.jsonl`, a UTF-8
+JSONL file where each line is exactly `{"queue": "team-a", "weight": 2}` — a non-empty queue name and a
+positive integer, no repeats. Providing it enables **fair mode**; omitting it changes nothing.
+
+* Waiting tasks are still ordered by priority first. Within a priority, the queue with the smallest
+  **weighted dominant share** goes first — the larger of its running CPU and memory fractions of the
+  cluster, divided by its weight — with `arrival`, `queue` and task `id` as stable tie-breakers. Shares
+  are recomputed after every placement, preemption and release.
+* Queues the tasks use but the file never declares weigh 1.
+* Trace decisions carry `queue`, `weight` and the pre-decision `weightedDominantShare` (six decimals).
+* Metrics gain a `queues` object (sorted by queue name) with `weight`, `placed`, `unplaced`,
+  `averageWait`, `cpuTime`, `memoryTime` and `dominantShare` per queue; resource time accumulates over
+  actual running intervals, so a preempted task counts only until its termination.
+* The same mapping is accepted by the Python entry points: `simulate(nodes, tasks, queue_weights={...})`.
+* An unreadable, empty, duplicate or non-positive-weight file is a `validation_error`; broken JSON, a
+  non-object line, a missing/typed/unknown field is a `parse_error` with the original line number. Both
+  exit 2 with no partial output.
+
 ## What the scheduler promises
 
 * **Every rejection says why.** Predicates are checked in a fixed order (capacity, affinity,
