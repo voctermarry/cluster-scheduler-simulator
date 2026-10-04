@@ -195,6 +195,86 @@ class SimulationTests(unittest.TestCase):
         starts_without = {item.task_id: item.start for item in without.placements}
         self.assertLessEqual(starts_with["tiny"], starts_without["tiny"])
 
+    def test_backfill_starts_a_short_task_behind_a_blocked_head_immediately(self) -> None:
+        cluster_nodes = (Node("n1", Resources(4, 4)),)
+        tasks = (
+            task("long", cpu=2, memory=2, priority=9, duration=10),
+            task("head", cpu=3, memory=3, priority=5, duration=2),
+            task("short", cpu=2, memory=2, priority=1, duration=4),
+        )
+        with_backfill = simulate(cluster_nodes, tasks, backfill=True)
+        without = simulate(cluster_nodes, tasks, backfill=False)
+        starts_with = {item.task_id: item.start for item in with_backfill.placements}
+        starts_without = {item.task_id: item.start for item in without.placements}
+        self.assertEqual(starts_with, {"long": 0, "short": 0, "head": 10})
+        self.assertEqual(starts_without, {"long": 0, "head": 10, "short": 12})
+        short_decisions = [d for d in with_backfill.decisions if d["task"] == "short"]
+        self.assertEqual(len(short_decisions), 1)
+        self.assertEqual(short_decisions[0]["reason"], "backfill")
+        self.assertFalse(any(d["task"] == "short" and d.get("reason") == "backfill" for d in without.decisions))
+
+    def test_backfill_boundary_is_inclusive(self) -> None:
+        cluster_nodes = (Node("n1", Resources(4, 4)),)
+        running_and_head = (
+            task("long", cpu=2, memory=2, priority=9, duration=10),
+            task("head", cpu=3, memory=3, priority=5, duration=2),
+        )
+        exact = simulate(cluster_nodes, running_and_head + (task("exact", cpu=1, priority=1, duration=10),), backfill=True)
+        self.assertEqual({item.task_id: item.start for item in exact.placements}["exact"], 0)
+        over = simulate(cluster_nodes, running_and_head + (task("over", cpu=1, priority=1, duration=11),), backfill=True)
+        self.assertEqual({item.task_id: item.start for item in over.placements}["over"], 10)
+        self.assertFalse(any(d["task"] == "over" and d.get("reason") == "backfill" for d in over.decisions))
+
+    def test_backfill_skips_ineligible_candidates_without_logging_them(self) -> None:
+        cluster_nodes = (Node("n1", Resources(4, 4)),)
+        tasks = (
+            task("long", cpu=2, memory=2, priority=9, duration=10),
+            task("head", cpu=3, memory=3, priority=5, duration=2),
+            task("big", cpu=3, memory=1, priority=4, duration=1),
+            task("tiny", cpu=1, memory=1, priority=1, duration=1),
+        )
+        result = simulate(cluster_nodes, tasks, backfill=True)
+        starts = {item.task_id: item.start for item in result.placements}
+        self.assertEqual(starts["tiny"], 0)
+        self.assertEqual(starts["big"], 12)
+        self.assertFalse(any(d["task"] == "big" and d.get("at") == 0 for d in result.decisions))
+
+    def test_backfill_never_happens_without_a_running_task(self) -> None:
+        cluster_nodes = (Node("n1", Resources(4, 4)),)
+        tasks = (task("aaa", cpu=9, memory=9), task("zzz", cpu=1, memory=1))
+        result = simulate(cluster_nodes, tasks, backfill=True)
+        self.assertEqual(result.unplaced, ["aaa", "zzz"])
+
+    def test_backfill_probes_never_preempt(self) -> None:
+        cluster_nodes = (Node("n1", Resources(4, 4)),)
+        tasks = (
+            task("long1", cpu=2, memory=2, priority=1, duration=10),
+            task("long2", cpu=2, memory=2, priority=9, duration=10),
+            task("head", cpu=3, memory=3, priority=5, arrival=1, duration=2),
+            task("pushy", cpu=2, memory=2, priority=4, arrival=1, duration=2),
+        )
+        result = simulate(cluster_nodes, tasks, backfill=True, allow_preemption=True)
+        starts = {item.task_id: item.start for item in result.placements}
+        self.assertEqual(starts["pushy"], 12)
+        self.assertEqual(result.metrics["preemptions"], 0)
+
+    def test_backfill_reorders_by_weighted_share_in_fair_mode(self) -> None:
+        cluster_nodes = (Node("n1", Resources(4, 4)),)
+        weights = {"a": 1, "b": 1}
+        tasks = (
+            task("long", cpu=2, memory=2, priority=9, duration=10, queue="a"),
+            task("head", cpu=3, memory=3, priority=5, duration=2, queue="a"),
+            task("fa", cpu=1, memory=1, priority=1, duration=2, queue="a"),
+            task("fb", cpu=1, memory=1, priority=1, duration=2, queue="b"),
+        )
+        first = simulate(cluster_nodes, tasks, backfill=True, queue_weights=weights)
+        second = simulate(cluster_nodes, tasks, backfill=True, queue_weights=weights)
+        backfilled = [d["task"] for d in first.decisions if d.get("reason") == "backfill"]
+        self.assertEqual(backfilled, ["fb", "fa"])
+        self.assertEqual(first.decisions, second.decisions)
+        self.assertEqual(first.trace(), second.trace())
+
+
     def test_preemption_places_a_high_priority_task_that_would_otherwise_wait(self) -> None:
         cluster_nodes = (Node("n1", Resources(2, 2)),)
         tasks = (

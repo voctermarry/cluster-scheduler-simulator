@@ -12,6 +12,12 @@ With ``queue_weights`` supplied the run is in fair-share mode: priorities still 
 list, but tasks of equal priority are picked from the queue with the smallest weighted dominant
 share -- max(used CPU / total CPU, used memory / total memory) / weight -- and shares are
 recomputed after every release, placement and preemption. Without that mapping, nothing changes.
+
+Conservative backfill: when the head of the waiting list cannot be placed, the tasks behind it are
+scanned in the same deterministic order, and the first one that fits right now *and* finishes at or
+before the earliest running task's completion may start immediately -- it can never delay the head.
+With nothing running there is no boundary and no backfill; ``backfill=False`` forbids jumping the
+queue entirely.
 """
 
 from __future__ import annotations
@@ -179,18 +185,22 @@ class Simulation:
             # `_try_place`) changes queue shares, so fair mode re-ranks the waiting list each time.
             # Without weights the ordering keys never change, which leaves the baseline walk identical.
             while waiting:
-                task = self._pending_order(waiting, clock)[0]
+                ordered = self._pending_order(waiting, clock)
+                task = ordered[0]
                 if self._try_place(task, clock):
                     waiting.remove(task)
                     progressed = True
                     continue
                 if self.backfill:
-                    horizon = self._running_end(clock)
-                    if horizon is not None and clock + task.duration <= horizon and self._try_place(task, clock, backfill=True):
-                        waiting.remove(task)
+                    backfilled = self._backfill(ordered[1:], clock)
+                    if backfilled is not None:
+                        # Re-release and re-check before the next pick: the backfilled task changed
+                        # the occupancy (and the shares) the next head is ranked and placed against.
+                        self._release_finished(clock)
+                        waiting.remove(backfilled)
                         progressed = True
                         continue
-                break  # the head of the queue is blocked; nothing behind it may jump the line
+                break  # the head is blocked and nothing behind it may safely jump the line
 
             if not self._active(clock) and not not_arrived:
                 break
@@ -256,6 +266,28 @@ class Simulation:
     def _annotate(self, document: dict[str, object], context: dict[str, object]) -> dict[str, object]:
         document.update(context)
         return document
+
+    def _backfill(self, candidates: list[Task], clock: int) -> Task | None:
+        """The first waiting task, in queue order, that fits now and ends by the earliest completion.
+
+        Conservative backfill: a task behind a blocked head may start only if it finishes at or
+        before the earliest running task's completion, so the head's wait can never grow. With
+        nothing running there is no boundary to protect, so no backfill happens at all. Probing is
+        pure -- a candidate that fails the time boundary or the resource check is skipped silently,
+        never placed and never logged as a refusal -- and only a candidate certain to fit reaches
+        `_try_place`, which means a probe can never trigger preemption either.
+        """
+        horizon = self._running_end(clock)
+        if horizon is None:
+            return None
+        for task in candidates:
+            if clock + task.duration > horizon:
+                continue
+            if select_node(self._cluster, task, self.policy).node_id is None:
+                continue
+            if self._try_place(task, clock, backfill=True):
+                return task
+        return None
 
     def _try_place(self, task: Task, clock: int, backfill: bool = False) -> bool:
         context = self._fair_context(task, clock)
