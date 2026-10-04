@@ -170,6 +170,30 @@ class CLITests(unittest.TestCase):
         refusals = [entry for entry in json.loads(out)["decisions"] if entry["task"] == "big" and "no node fits" in entry["reason"]]
         self.assertEqual(len(refusals), 1)
 
+    # -- conservative backfill -------------------------------------------------------------------
+    BACKFILL_CLUSTER = [{"id": "n1", "cpu": 4, "memory": 4}]
+    BACKFILL_TASKS = [
+        {"id": "long", "cpu": 2, "memory": 2, "duration": 10},
+        {"id": "head", "cpu": 4, "memory": 4, "duration": 10, "arrival": 1},
+        {"id": "short", "cpu": 2, "memory": 2, "duration": 2, "arrival": 1},
+    ]
+
+    def test_backfill_starts_the_short_task_and_marks_the_reason(self) -> None:
+        cluster = self.write("bf_cluster.jsonl", self.BACKFILL_CLUSTER)
+        tasks = self.write("bf_tasks.jsonl", self.BACKFILL_TASKS)
+        code, out, err = run_cli(["trace", "--cluster", cluster, "--tasks", tasks])
+        self.assertEqual((code, err), (EXIT_OK, ""))
+        short = next(d for d in json.loads(out)["decisions"] if d["task"] == "short")
+        self.assertEqual(short["reason"], "backfill")
+        self.assertEqual(short["at"], 1)
+
+    def test_no_backfill_keeps_the_short_task_behind_the_head(self) -> None:
+        cluster = self.write("nbf_cluster.jsonl", self.BACKFILL_CLUSTER)
+        tasks = self.write("nbf_tasks.jsonl", self.BACKFILL_TASKS)
+        _, with_flag, _ = run_cli(["simulate", "--cluster", cluster, "--tasks", tasks, "--no-backfill"])
+        starts = {p["task"]: p["start"] for p in json.loads(with_flag)["placements"]}
+        self.assertEqual(starts, {"long": 0, "head": 10, "short": 20})
+
     # -- weighted fair share ---------------------------------------------------------------------
     def write_weights(self, rows: list, name: str = "weights.jsonl") -> str:
         return self.write(name, rows)

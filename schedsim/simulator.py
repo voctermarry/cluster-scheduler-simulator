@@ -178,19 +178,44 @@ class Simulation:
             # The head is re-picked after every attempt: a placement (or a preemption inside
             # `_try_place`) changes queue shares, so fair mode re-ranks the waiting list each time.
             # Without weights the ordering keys never change, which leaves the baseline walk identical.
+            # A task already refused as head at THIS clock is never refused a second time after one of
+            # its own backfills (or a fair-share re-rank) tightened the free numbers: the re-check the
+            # backfill loop performs must not write a duplicate refusal.
+            refused_at_clock: set[str] = set()
             while waiting:
-                task = self._pending_order(waiting, clock)[0]
-                if self._try_place(task, clock):
-                    waiting.remove(task)
-                    progressed = True
-                    continue
-                if self.backfill:
-                    horizon = self._running_end(clock)
-                    if horizon is not None and clock + task.duration <= horizon and self._try_place(task, clock, backfill=True):
-                        waiting.remove(task)
+                ordered = self._pending_order(waiting, clock)
+                head = ordered[0]
+                if head.id not in refused_at_clock:
+                    if self._try_place(head, clock):
+                        waiting.remove(head)
                         progressed = True
                         continue
-                break  # the head of the queue is blocked; nothing behind it may jump the line
+                    refused_at_clock.add(head.id)
+                # The head cannot be served right now. Conservative backfill looks PAST it -- at the
+                # tasks behind it in this same deterministic order -- and starts the first one that
+                # already fits a node and finishes by the earliest running completion, so it cannot
+                # delay the head it jumped. Nothing may jump when nothing is running (the capacity
+                # the head waits for cannot reappear before a completion), and --no-backfill forbids
+                # jumping altogether.
+                if not self.backfill:
+                    break
+                horizon = self._running_end(clock)
+                if horizon is None:
+                    break
+                jumped = False
+                # The order and horizon are rebuilt after every jump: shares and occupancy changed.
+                for candidate in self._pending_order(waiting, clock)[1:]:
+                    if clock + candidate.duration > horizon:
+                        continue  # past the time boundary: not a placement and not a refusal
+                    if self._try_backfill(candidate, clock):
+                        waiting.remove(candidate)
+                        progressed = True
+                        jumped = True
+                        break
+                    # A failed probe changes nothing: no pseudo-placement, no logged refusal, no
+                    # preemption. The scan continues with the next candidate in the same order.
+                if not jumped:
+                    break  # nobody behind the head qualified this tick
 
             if not self._active(clock) and not not_arrived:
                 break
@@ -257,7 +282,7 @@ class Simulation:
         document.update(context)
         return document
 
-    def _try_place(self, task: Task, clock: int, backfill: bool = False) -> bool:
+    def _try_place(self, task: Task, clock: int) -> bool:
         context = self._fair_context(task, clock)
         decision = select_node(self._cluster, task, self.policy)
         if decision.node_id is not None:
@@ -267,7 +292,7 @@ class Simulation:
                     {
                         "task": task.id,
                         "node": decision.node_id,
-                        "reason": "backfill" if backfill else decision.reason,
+                        "reason": decision.reason,
                         "at": clock,
                     },
                     context,
@@ -296,6 +321,35 @@ class Simulation:
             return True
         self._record_refusal(task, decision.reason, clock, context)
         return False
+
+    def _try_backfill(self, task: Task, clock: int) -> bool:
+        """Place a task jumping a blocked head, or fail with NO side effects.
+
+        The caller has already checked the time boundary (``clock + duration`` must not pass the
+        earliest running completion). The probe applies exactly the same node selection as a normal
+        attempt -- capacity, affinity, anti-affinity, taints and the first-fit / best-fit node order
+        are unchanged. A candidate that does not fit right now produces neither a placement nor a
+        refusal and never triggers preemption: probing is free and invisible, so a failed candidate
+        can still be placed later as an ordinary head.
+        """
+        decision = select_node(self._cluster, task, self.policy)
+        if decision.node_id is None:
+            return False
+        context = self._fair_context(task, clock)
+        self._place(task, decision.node_id, clock, ())
+        self._decisions.append(
+            self._annotate(
+                {
+                    "task": task.id,
+                    "node": decision.node_id,
+                    "reason": "backfill",
+                    "at": clock,
+                },
+                context,
+            )
+        )
+        self._last_refusal.pop(task.id, None)
+        return True
 
     def _metrics(self, makespan: int, unplaced: list[str]) -> dict[str, object]:
         total_cpu = self._cluster.total_capacity().cpu

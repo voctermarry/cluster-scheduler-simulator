@@ -94,9 +94,18 @@ broken JSON, a non-object row, a missing field, a wrong type or an unknown field
   that sentence instead of evicting and still failing.
 * **Capacity is never over-committed.** The test suite re-walks a schedule tick by tick and asserts the
   sum of concurrent requests fits each node.
-* **Backfill is bounded.** A task may pass a blocked head only when it finishes before the earliest
-  running completion (`now + duration <= horizon`), which is the conservative rule: it cannot delay the
-  head it passed.
+* **Backfill is bounded.** When the waiting head cannot be placed, and only then, the scheduler
+  looks at the tasks behind it in the same waiting order and starts the **first** one that already
+  fits a node and finishes by the earliest running completion (`now + duration <= horizon`) -- the
+  conservative rule, so a backfilled task can never delay the head it passed. The boundary is
+  inclusive: ending exactly at the horizon is allowed, one tick later is not. Backfill never runs
+  with no task active (there is no completion to bound against), and `--no-backfill` forbids
+  jumping altogether. A candidate that fails the resource check or the time boundary is probed
+  without side effects: no placement, no refusal in the trace, no preemption. A successful
+  backfill is recorded with the fixed reason `backfill`; afterwards the scheduler re-ranks the
+  waiters on the fresh occupancy and weighted shares and may place or backfill again at the same
+  tick. Affinity, anti-affinity, taints, first-fit / best-fit node choice and the preemption rules
+  are unchanged inside a backfill.
 * **Reproducibility is checked, not asserted.** `replay` runs the same input through the simulator twice
   and compares the full `(task, node, start, end)` trace, reporting `identical` and any difference, and
   exiting **3** when the two runs disagree.
