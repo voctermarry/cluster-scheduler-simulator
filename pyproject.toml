@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cluster-scheduler-simulator"
+version = "0.1.0"
+description = "Deterministic cluster scheduler simulation with quotas and preemption (stdlib only)"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+cluster-scheduler-simulator = "schedsim.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["schedsim*"]
