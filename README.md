@@ -44,6 +44,42 @@ Unknown fields are rejected.
 
 Common options: `--policy first-fit|best-fit`, `--preemption`, `--no-backfill`, `--cluster -` for stdin.
 
+## Weighted fair share
+
+`simulate`, `trace`, `metrics`, `policies` and `replay` accept `--queue-weights PATH`, a UTF-8
+JSONL file with one object per line:
+
+```json
+{"queue": "team-a", "weight": 2}
+{"queue": "team-b", "weight": 1}
+```
+
+Each valid row contains exactly the non-empty string `queue` and the positive integer `weight`;
+queues must not repeat. A queue used by a task but absent from the file has an implicit weight of
+1. Supplying the file enables **fair mode**; without it every ordering, output field and exit code
+is unchanged.
+
+In fair mode each simulation tick first releases finished tasks, then waiting tasks are ordered by
+higher `priority` first; at equal priority the task comes from the queue with the smallest
+**weighted dominant share** — `max(used CPU / total CPU, used memory / total memory) / weight` over
+the running tasks — and remaining ties break on `arrival`, queue name and task id. Shares are
+recomputed after every release, placement and preemption. Node selection (first-fit / best-fit),
+affinity, anti-affinity, taints, preemption candidates and the conservative backfill boundary keep
+their existing semantics. The Python entry points (`simulate`, `replay`, `compare_policies`,
+`Simulation`) take the same configuration as a mapping, `queue_weights={"team-a": 2}`.
+
+The `trace` decisions gain `queue`, `weight` and `weightedDominantShare` (the pre-decision share,
+six decimals); `replay` produces an identical placement trace. Metrics gain a `queues` object keyed
+by queue name (sorted); each queue reports `weight`, `placed`, `unplaced`, `averageWait`,
+`cpuTime`, `memoryTime` and `dominantShare`. Resource time accumulates over the actual running
+interval (a preempted task counts only up to its eviction tick), and `dominantShare` is
+`max(cpu-time / cpu-capacity, memory-time / memory-capacity) / makespan / weight`, or `0` when
+capacity or makespan is zero. `policies` attaches the same per-queue metrics to every policy.
+
+An unreadable, empty, or duplicate-queue file, or a non-positive weight, is a `validation_error`;
+broken JSON, a non-object row, a missing field, a wrong type or an unknown field is a
+`parse_error` carrying the raw line number. Both exit **2** with nothing written to stdout.
+
 ## What the scheduler promises
 
 * **Every rejection says why.** Predicates are checked in a fixed order (capacity, affinity,

@@ -170,6 +170,118 @@ class CLITests(unittest.TestCase):
         refusals = [entry for entry in json.loads(out)["decisions"] if entry["task"] == "big" and "no node fits" in entry["reason"]]
         self.assertEqual(len(refusals), 1)
 
+    # -- weighted fair share ---------------------------------------------------------------------
+    def write_weights(self, rows: list, name: str = "weights.jsonl") -> str:
+        return self.write(name, rows)
+
+    def FAIR_TASKS(self) -> list:
+        return [
+            {"id": "a1", "cpu": 2, "memory": 2, "queue": "a", "duration": 4},
+            {"id": "a2", "cpu": 2, "memory": 2, "queue": "a", "duration": 2},
+            {"id": "b1", "cpu": 2, "memory": 2, "queue": "b", "duration": 2},
+        ]
+
+    def test_queue_weights_change_the_schedule_and_annotate_the_trace(self) -> None:
+        tasks = self.write("fair.jsonl", self.FAIR_TASKS())
+        weights = self.write_weights([{"queue": "a", "weight": 2}, {"queue": "b", "weight": 1}])
+        code, out, err = run_cli(["trace", "--cluster", self.cluster, "--tasks", tasks, "--queue-weights", weights])
+        self.assertEqual((code, err), (EXIT_OK, ""))
+        decisions = json.loads(out)["decisions"]
+        self.assertEqual([d["task"] for d in decisions if "node" in d], ["a1", "b1", "a2"])
+        for decision in decisions:
+            self.assertIn("queue", decision)
+            self.assertIn("weight", decision)
+            self.assertIn("weightedDominantShare", decision)
+            self.assertIsInstance(decision["weightedDominantShare"], float)
+        first_b = next(d for d in decisions if d["task"] == "b1" and "node" in d)
+        self.assertEqual(first_b["weightedDominantShare"], 0.0)
+
+    def test_metrics_report_sorted_queues(self) -> None:
+        tasks = self.write("fairm.jsonl", self.FAIR_TASKS())
+        weights = self.write_weights([{"queue": "b", "weight": 1}, {"queue": "a", "weight": 2}])
+        code, out, _ = run_cli(["metrics", "--cluster", self.cluster, "--tasks", tasks, "--queue-weights", weights])
+        self.assertEqual(code, EXIT_OK)
+        queues = json.loads(out)["metrics"]["queues"]
+        self.assertEqual(list(queues), ["a", "b"])
+        self.assertEqual(set(queues["a"]), {"weight", "placed", "unplaced", "averageWait", "cpuTime", "memoryTime", "dominantShare"})
+
+    def test_policies_include_queue_metrics_in_fair_mode(self) -> None:
+        tasks = self.write("fairp.jsonl", self.FAIR_TASKS())
+        weights = self.write_weights([{"queue": "a", "weight": 2}])
+        code, out, _ = run_cli(["policies", "--cluster", self.cluster, "--tasks", tasks, "--queue-weights", weights])
+        self.assertEqual(code, EXIT_OK)
+        for entry in json.loads(out)["policies"]:
+            self.assertIn("queues", entry)
+            self.assertEqual(entry["queues"]["b"]["weight"], 1)
+
+    def test_replay_is_identical_in_fair_mode(self) -> None:
+        tasks = self.write("fairr.jsonl", self.FAIR_TASKS())
+        weights = self.write_weights([{"queue": "a", "weight": 2}, {"queue": "b", "weight": 1}])
+        code, out, _ = run_cli(["replay", "--cluster", self.cluster, "--tasks", tasks, "--queue-weights", weights])
+        self.assertEqual(code, EXIT_OK)
+        self.assertTrue(json.loads(out)["identical"])
+
+    def test_without_weights_outputs_no_fair_fields(self) -> None:
+        tasks = self.write("plain.jsonl", self.FAIR_TASKS())
+        _, out, _ = run_cli(["trace", "--cluster", self.cluster, "--tasks", tasks])
+        for decision in json.loads(out)["decisions"]:
+            self.assertNotIn("weightedDominantShare", decision)
+        _, out, _ = run_cli(["metrics", "--cluster", self.cluster, "--tasks", tasks])
+        self.assertNotIn("queues", json.loads(out)["metrics"])
+
+    def test_unreadable_weights_file_is_a_validation_error(self) -> None:
+        tasks = self.write("fairx.jsonl", self.FAIR_TASKS())
+        code, out, err = run_cli(["metrics", "--cluster", self.cluster, "--tasks", tasks, "--queue-weights", "/no/such/file.jsonl"])
+        self.assertEqual((code, out), (EXIT_ERROR, ""))
+        self.assertEqual(json.loads(err)["error"], "validation_error")
+
+    def test_empty_weights_file_is_a_validation_error(self) -> None:
+        tasks = self.write("faire.jsonl", self.FAIR_TASKS())
+        weights = self.write_weights([])
+        code, out, err = run_cli(["metrics", "--cluster", self.cluster, "--tasks", tasks, "--queue-weights", weights])
+        self.assertEqual((code, out), (EXIT_ERROR, ""))
+        self.assertEqual(json.loads(err)["error"], "validation_error")
+
+    def test_duplicate_queue_is_a_validation_error_with_line(self) -> None:
+        tasks = self.write("faird.jsonl", self.FAIR_TASKS())
+        with open(weights_path := os.path.join(self.directory.name, "dupw.jsonl"), "w") as handle:
+            handle.write('{"queue": "a", "weight": 1}\n{"queue": "a", "weight": 3}\n')
+        code, out, err = run_cli(["metrics", "--cluster", self.cluster, "--tasks", tasks, "--queue-weights", weights_path])
+        self.assertEqual((code, out), (EXIT_ERROR, ""))
+        document = json.loads(err)
+        self.assertEqual(document["error"], "validation_error")
+        self.assertEqual(document["line"], 2)
+
+    def test_non_positive_weight_is_a_validation_error(self) -> None:
+        tasks = self.write("fairz.jsonl", self.FAIR_TASKS())
+        weights = self.write_weights([{"queue": "a", "weight": 0}])
+        code, _, err = run_cli(["metrics", "--cluster", self.cluster, "--tasks", tasks, "--queue-weights", weights])
+        self.assertEqual(code, EXIT_ERROR)
+        document = json.loads(err)
+        self.assertEqual(document["error"], "validation_error")
+        self.assertEqual(document["line"], 1)
+
+    def test_weights_parse_errors_name_the_raw_line(self) -> None:
+        tasks = self.write("fairb.jsonl", self.FAIR_TASKS())
+        cases = {
+            "badjson": ['{"queue": "a", "weight": 1}', "{broken"],
+            "nonobject": ['{"queue": "a", "weight": 1}', "[1]"],
+            "missing": ['{"queue": "a"}'],
+            "type": ['{"queue": "a", "weight": "2"}'],
+            "unknown": ['{"queue": "a", "weight": 1, "extra": 2}'],
+            "emptystring": ['{"queue": "", "weight": 1}'],
+            "boolweight": ['{"queue": "a", "weight": true}'],
+        }
+        for name, lines in cases.items():
+            path = os.path.join(self.directory.name, f"w-{name}.jsonl")
+            with open(path, "w") as handle:
+                handle.write("\n".join(lines) + "\n")
+            code, out, err = run_cli(["metrics", "--cluster", self.cluster, "--tasks", tasks, "--queue-weights", path])
+            self.assertEqual((code, out), (EXIT_ERROR, ""), name)
+            document = json.loads(err)
+            self.assertEqual(document["error"], "parse_error", name)
+            self.assertEqual(document["line"], 2 if name in ("badjson", "nonobject") else 1, name)
+
 
 if __name__ == "__main__":
     unittest.main()
