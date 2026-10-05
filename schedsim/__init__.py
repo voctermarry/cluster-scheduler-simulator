@@ -12,6 +12,7 @@ from .policies import (
     order_candidates,
     preemption_candidates,
     select_node,
+    static_constraints,
     taint_predicate,
 )
 from .simulator import Simulation, SimulationResult, compare_policies, replay, simulate
@@ -41,6 +42,7 @@ __all__ = [
     "replay",
     "select_node",
     "simulate",
+    "static_constraints",
     "taint_predicate",
 ]
 

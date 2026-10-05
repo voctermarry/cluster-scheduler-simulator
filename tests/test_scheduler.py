@@ -20,6 +20,7 @@ from schedsim import (
     replay,
     select_node,
     simulate,
+    static_constraints,
     taint_predicate,
 )
 
@@ -156,6 +157,188 @@ class PreemptionTests(unittest.TestCase):
         chosen, reason = preemption_candidates(self.cluster, huge, Node("n1", self.capacity), placements, tasks, 1)
         self.assertEqual(chosen, [])
         self.assertIn("would not fit", reason)
+
+
+class PreemptionConstraintTests(unittest.TestCase):
+    """Preemption buys resources, never affinity, anti-affinity or taint compatibility."""
+
+    def constrained_nodes(self) -> tuple[Node, ...]:
+        return (
+            Node("n1", Resources(4, 4), labels=(("zone", "a"),)),
+            Node("n2", Resources(4, 4), labels=(("zone", "b"),), taints=("gpu",)),
+            Node("n3", Resources(4, 4), labels=(("spot", "true"), ("zone", "c"))),
+        )
+
+    def state(self, cluster: Cluster, node_id: str):
+        from schedsim import Placement
+
+        low = task(f"low-{node_id}", cpu=4, memory=4, priority=1, duration=10)
+        cluster.occupy(node_id, low.request)
+        placements = [Placement(low.id, node_id, 0, 10)]
+        return placements, {low.id: low}, low
+
+    def test_preemption_requires_the_same_affinity_as_ordinary_placement(self) -> None:
+        cluster = Cluster(self.constrained_nodes())
+        placements, tasks, _ = self.state(cluster, "n1")
+        pinned = task("hi", cpu=4, memory=4, priority=9, affinity=(("zone", "b"),))
+        # n1 satisfies nothing: no victims may be named there, and the reason is the predicate's.
+        chosen, reason = preemption_candidates(cluster, pinned, cluster.node("n1"), placements, tasks, 1)
+        self.assertEqual(chosen, [])
+        self.assertIn("affinity zone=b not satisfied", reason)
+
+    def test_preemption_requires_the_same_anti_affinity_and_taints(self) -> None:
+        cluster = Cluster(self.constrained_nodes())
+        placements, tasks, _ = self.state(cluster, "n3")
+        avoiding = task("hi", cpu=4, memory=4, priority=9, anti_affinity=("spot",))
+        chosen, reason = preemption_candidates(cluster, avoiding, cluster.node("n3"), placements, tasks, 1)
+        self.assertEqual(chosen, [])
+        self.assertIn("anti-affinity", reason)
+
+        placements, tasks, _ = self.state(cluster, "n2")
+        intolerant = task("hi", cpu=4, memory=4, priority=9, affinity=(("zone", "b"),))
+        chosen, reason = preemption_candidates(cluster, intolerant, cluster.node("n2"), placements, tasks, 1)
+        self.assertEqual(chosen, [])
+        self.assertIn("untolerated taint gpu", reason)
+        # the matching toleration makes the very same node eligible again
+        tolerant = task("hi", cpu=4, memory=4, priority=9, affinity=(("zone", "b"),), tolerations=("gpu",))
+        chosen, _ = preemption_candidates(cluster, tolerant, cluster.node("n2"), placements, tasks, 1)
+        self.assertEqual([item.task_id for item in chosen], ["low-n2"])
+
+    def test_static_constraints_match_fits_for_every_task_node_pair(self) -> None:
+        cluster = Cluster(self.constrained_nodes())
+        cluster.occupy("n1", Resources(4, 4))
+        probes = (
+            task("a", affinity=(("zone", "a"),)),
+            task("b", affinity=(("zone", "b"),), tolerations=("gpu",)),
+            task("c", anti_affinity=("spot",)),
+            task("mismatch", affinity=(("zone", "zzz"),)),
+        )
+        for probe in probes:
+            for node in self.constrained_nodes():
+                static_ok, _ = static_constraints(probe, node)
+                # capacity is held out of the static check, so feed `fits` enough free room to
+                # isolate exactly the same conclusion about labels and taints
+                roomy = Cluster((Node(node.id, Resources(100, 100), labels=node.labels, taints=node.taints),))
+                full_ok, _ = fits(roomy, probe, roomy.node(node.id))
+                self.assertIs(static_ok, full_ok, (probe.id, node.id))
+
+    def test_smaller_id_incompatible_node_is_not_evicted(self) -> None:
+        nodes = self.constrained_nodes()
+        tasks = (
+            task("low1", cpu=4, memory=4, priority=1, duration=10),
+            task("low2", cpu=4, memory=4, priority=1, duration=10, affinity=(("zone", "b"),),
+                 tolerations=("gpu",)),
+            task("low3", cpu=4, memory=4, priority=1, duration=10),
+            task("hi", cpu=4, memory=4, priority=9, arrival=1, duration=2,
+                 affinity=(("zone", "b"),), tolerations=("gpu",)),
+        )
+        result = simulate(nodes, tasks, allow_preemption=True)
+        placed = {p.task_id: p for p in result.placements}
+        # n1 is the smallest id and its low1 is evictable, but it cannot serve a zone=b task: it
+        # must be left alone and the eviction happens on n2.
+        self.assertEqual(placed["hi"].node_id, "n2")
+        self.assertEqual(placed["hi"].preempted, ("low2",))
+        self.assertEqual((placed["low1"].start, placed["low1"].end), (0, 10))
+        self.assertEqual((placed["low2"].start, placed["low2"].end), (0, 1))
+        self.assertEqual(result.metrics["preemptions"], 1)
+        decision = next(d for d in result.decisions if d["task"] == "hi")
+        self.assertEqual(decision["node"], "n2")
+        self.assertIn("on n2", decision["reason"])
+
+    def test_search_continues_to_the_compatible_node_under_each_policy(self) -> None:
+        # The preemption walk is always id-ordered, never the policy's best-fit reordering: under
+        # either policy n1 (smallest id, full of an evictable victim) must be skipped on affinity
+        # and the eviction must happen on n2.
+        nodes = (
+            Node("n1", Resources(4, 4), labels=(("zone", "a"),)),
+            Node("n2", Resources(4, 4), labels=(("zone", "b"),)),
+        )
+        tasks = (
+            task("low1", cpu=4, memory=4, priority=1, duration=10),
+            task("low2", cpu=4, memory=4, priority=1, duration=10, affinity=(("zone", "b"),)),
+            task("hi", cpu=4, memory=4, priority=9, arrival=1, duration=2, affinity=(("zone", "b"),)),
+        )
+        for policy in ("first-fit", "best-fit"):
+            with self.subTest(policy=policy):
+                result = simulate(nodes, tasks, policy=policy, allow_preemption=True)
+                placed = {p.task_id: p for p in result.placements}
+                self.assertEqual(placed["hi"].node_id, "n2")
+                self.assertEqual(placed["hi"].preempted, ("low2",))
+                self.assertEqual((placed["low1"].start, placed["low1"].end), (0, 10))
+                self.assertEqual(result.metrics["preemptions"], 1)
+
+    def test_task_waits_for_a_release_when_evictable_tasks_cannot_fit_it(self) -> None:
+        # n1 (zone=a) is the only compatible node, but it is held by a higher-priority anchor that
+        # is not an eviction victim, so no set of strictly-lower-priority tasks can free room yet.
+        # The task waits on the ordinary clock and is served the tick the anchor finishes; n2 is
+        # incompatible and is merely skipped, never looted.
+        nodes = (
+            Node("n1", Resources(4, 4), labels=(("zone", "a"),)),
+            Node("n2", Resources(4, 4), labels=(("zone", "b"),)),
+        )
+        tasks = (
+            task("anchor", cpu=4, memory=4, priority=9, duration=3, affinity=(("zone", "a"),)),
+            task("hi", cpu=4, memory=4, priority=5, arrival=1, duration=2, affinity=(("zone", "a"),)),
+        )
+        result = simulate(nodes, tasks, allow_preemption=True)
+        placed = {p.task_id: p for p in result.placements}
+        self.assertEqual(result.metrics["preemptions"], 0)
+        self.assertEqual(placed["hi"].node_id, "n1")
+        self.assertEqual((placed["anchor"].start, placed["anchor"].end), (0, 3))
+        self.assertEqual((placed["hi"].start, placed["hi"].end), (3, 5))
+        # the blocked wait is recorded with the stable "no node fits" refusal and retried silently
+        refusal = next(d for d in result.decisions if d["task"] == "hi" and "node" not in d)
+        self.assertIn("no node fits", refusal["reason"])
+        self.assertEqual(refusal["at"], 1)
+
+    def test_no_compatible_node_even_with_full_eviction_leaves_unplaced_without_fake_records(self) -> None:
+        # Every node is forbidden to the high-priority task (its affinity key exists nowhere), so
+        # even with preemption enabled and evictable victims on every node, no eviction occurs and
+        # the task stays waiting until the run ends.
+        nodes = self.constrained_nodes()
+        tasks = (
+            task("low1", cpu=4, memory=4, priority=1, duration=10),
+            task("low2", cpu=4, memory=4, priority=1, duration=10, affinity=(("zone", "b"),),
+                 tolerations=("gpu",)),
+            task("low3", cpu=4, memory=4, priority=1, duration=10),
+            task("stranded", cpu=4, memory=4, priority=9, arrival=1, duration=2,
+                 affinity=(("zone", "never"),)),
+        )
+        result = simulate(nodes, tasks, allow_preemption=True)
+        self.assertEqual(result.unplaced, ["stranded"])
+        self.assertEqual(result.metrics["preemptions"], 0)
+        self.assertTrue(all(not p.preempted for p in result.placements))
+        for victim in ("low1", "low2", "low3"):
+            placement = next(p for p in result.placements if p.task_id == victim)
+            self.assertEqual((placement.start, placement.end), (0, 10))
+        # the trace keeps the ordinary "no node fits" refusal (capacity is the first predicate on
+        # the still-full nodes, exactly the existing format) and shows no phantom preemption
+        refusal = next(d for d in result.decisions if d["task"] == "stranded" and "node" not in d)
+        self.assertTrue(refusal["reason"].startswith("no node fits"))
+        self.assertFalse(
+            any(str(d.get("reason", "")).startswith("preempting") for d in result.decisions)
+        )
+
+    def test_waiting_task_is_served_at_a_compatible_node_after_a_release(self) -> None:
+        # n3 (zone=c) is the ONLY node compatible with the incoming task; it is held by a
+        # higher-priority anchor that is not an eligible victim. The smaller-id n1/n2 are full of
+        # evictable low-priority tasks but fail the affinity, so the scheduler may not loot them:
+        # the task waits on the ordinary clock and starts exactly when the anchor finishes.
+        nodes = self.constrained_nodes()
+        tasks = (
+            task("low1", cpu=4, memory=4, priority=1, duration=10),
+            task("low2", cpu=4, memory=4, priority=1, duration=10, affinity=(("zone", "b"),),
+                 tolerations=("gpu",)),
+            task("anchor", cpu=4, memory=4, priority=9, duration=3, affinity=(("zone", "c"),)),
+            task("hi", cpu=4, memory=4, priority=5, arrival=1, duration=2, affinity=(("zone", "c"),)),
+        )
+        result = simulate(nodes, tasks, allow_preemption=True)
+        placed = {p.task_id: p for p in result.placements}
+        self.assertEqual(result.metrics["preemptions"], 0)
+        self.assertEqual(placed["hi"].node_id, "n3")
+        self.assertEqual((placed["anchor"].start, placed["anchor"].end), (0, 3))
+        self.assertEqual((placed["hi"].start, placed["hi"].end), (3, 5))
+        self.assertEqual((placed["low1"].start, placed["low1"].end), (0, 10))
 
 
 class SimulationTests(unittest.TestCase):

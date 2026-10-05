@@ -147,6 +147,80 @@ class CLITests(unittest.TestCase):
         self.assertEqual(json.loads(with_preemption)["metrics"]["preemptions"], 1)
 
 
+    def test_preemption_cannot_bypass_placement_constraints(self) -> None:
+        # n1 is the smallest node id and full of an evictable task, but the high-priority task is
+        # pinned to zone=b and cannot tolerate the gpu taint either; only n2 is compatible. The
+        # preemptive placement must land on n2 and leave n1's task untouched.
+        cluster_rows = [
+            {"id": "n1", "cpu": 4, "memory": 8, "labels": {"zone": "a"}},
+            {"id": "n2", "cpu": 4, "memory": 8, "labels": {"zone": "b"}, "taints": ["gpu"]},
+        ]
+        task_rows = [
+            {"id": "lowA", "cpu": 4, "memory": 8, "priority": 1, "duration": 6},
+            {"id": "lowB", "cpu": 4, "memory": 8, "priority": 1, "duration": 6,
+             "affinity": {"zone": "b"}, "tolerations": ["gpu"]},
+            {"id": "high", "cpu": 4, "memory": 8, "priority": 9, "arrival": 1, "duration": 1,
+             "affinity": {"zone": "b"}, "tolerations": ["gpu"]},
+        ]
+        cluster = self.write("pc_cluster.jsonl", cluster_rows)
+        tasks = self.write("pc_tasks.jsonl", task_rows)
+        code, out, err = run_cli(["simulate", "--cluster", cluster, "--tasks", tasks, "--preemption"])
+        self.assertEqual((code, err), (EXIT_OK, ""))
+        document = json.loads(out)
+        placements = {p["task"]: p for p in document["placements"]}
+        self.assertEqual(placements["high"]["node"], "n2")
+        self.assertEqual(placements["high"]["preempted"], ["lowB"])
+        # n1's evictable task was skipped, so its interval is the untruncated 0..6
+        self.assertEqual((placements["lowA"]["start"], placements["lowA"]["end"]), (0, 6))
+        self.assertEqual(document["metrics"]["preemptions"], 1)
+        # trace, metrics and replay tell the same story
+        code, trace_out, _ = run_cli(["trace", "--cluster", cluster, "--tasks", tasks, "--preemption"])
+        self.assertEqual(code, EXIT_OK)
+        high_decision = next(d for d in json.loads(trace_out)["decisions"] if d["task"] == "high")
+        self.assertEqual((high_decision["node"], high_decision["at"]), ("n2", 1))
+        code, metrics_out, _ = run_cli(["metrics", "--cluster", cluster, "--tasks", tasks, "--preemption"])
+        self.assertEqual(json.loads(metrics_out)["metrics"]["preemptions"], 1)
+        code, replay_out, _ = run_cli(["replay", "--cluster", cluster, "--tasks", tasks, "--preemption"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertTrue(json.loads(replay_out)["identical"])
+
+    def test_preemption_on_fully_incompatible_cluster_is_a_negative_verdict_without_evictions(self) -> None:
+        # Every node fails the high-priority task's affinity and carries an untolerated taint; even
+        # though each holds an evictable victim, no preemption may happen and the task stays
+        # unplaced: exit 3, zero preemptions, the ordinary "no node fits" refusal in the trace.
+        cluster_rows = [
+            {"id": "n1", "cpu": 4, "memory": 8, "taints": ["gpu"]},
+            {"id": "n2", "cpu": 4, "memory": 8, "labels": {"spot": "true"}},
+        ]
+        task_rows = [
+            {"id": "low1", "cpu": 4, "memory": 8, "priority": 1, "duration": 10, "tolerations": ["gpu"]},
+            {"id": "low2", "cpu": 4, "memory": 8, "priority": 1, "duration": 10},
+            {"id": "stranded", "cpu": 4, "memory": 8, "priority": 9, "arrival": 1, "duration": 1,
+             "affinity": {"zone": "b"}, "antiAffinity": ["spot"]},
+        ]
+        cluster = self.write("bad_cluster.jsonl", cluster_rows)
+        tasks = self.write("bad_tasks.jsonl", task_rows)
+        for command in ("simulate", "trace", "metrics"):
+            code, out, err = run_cli([command, "--cluster", cluster, "--tasks", tasks, "--preemption"])
+            self.assertEqual((code, err), (EXIT_NEGATIVE, ""), command)
+            document = json.loads(out)
+            if command == "metrics":
+                self.assertEqual(document["metrics"]["preemptions"], 0)
+                self.assertEqual(document["metrics"]["unplaced"], 1)
+            else:
+                self.assertEqual(document["unplaced"], ["stranded"])
+            if command == "trace":
+                refusal = next(d for d in document["decisions"] if d["task"] == "stranded")
+                self.assertIn("no node fits", refusal["reason"])
+                self.assertFalse(
+                    any(str(d.get("reason", "")).startswith("preempting") for d in document["decisions"])
+                )
+        # the victims keep their full intervals
+        _, out, _ = run_cli(["simulate", "--cluster", cluster, "--tasks", tasks, "--preemption"])
+        for victim in json.loads(out)["placements"]:
+            self.assertEqual((victim["start"], victim["end"]), (0, 10))
+            self.assertNotIn("preempted", victim)
+
     def test_validate_rejects_duplicate_node_ids(self) -> None:
         # The end-to-end run found `validate` exiting 0 for a cluster with a repeated node id, because
         # it only built Node objects and never a Cluster (whose constructor owns that check).

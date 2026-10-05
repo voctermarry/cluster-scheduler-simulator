@@ -151,10 +151,45 @@ def scenario_fair() -> Scenario:
     )
 
 
+def scenario_preemption_constraints() -> Scenario:
+    """Preemption meets affinity, anti-affinity and taints: it may only buy resources.
+
+    n1 (smallest id) is full of an evictable low-priority task but carries the ``spot`` label the
+    high-priority anti-affinity task forbids, so that task must pass n1 without touching its
+    victim. n2 is reachable only through a ``zone=b`` affinity, n3 only through ``zone=c`` plus a
+    gpu taint tolerance. Each high-priority arrival therefore lands on a later compatible node
+    with the same minimal-victim rule, while the tempting smaller-id nodes stay untouched.
+    """
+    return Scenario(
+        "preemption-constraints",
+        (
+            Node("n1", Resources(4, 4), labels=(("spot", "true"), ("zone", "a"))),
+            Node("n2", Resources(4, 4), labels=(("zone", "b"),)),
+            Node("n3", Resources(4, 4), labels=(("zone", "c"),), taints=("gpu",)),
+        ),
+        (
+            task("lowA", cpu=4, memory=4, priority=1, queue="lo", arrival=0, duration=10),
+            task("lowB", cpu=4, memory=4, priority=1, queue="lo", arrival=0, duration=10,
+                 affinity=(("zone", "b"),)),
+            task("lowG", cpu=4, memory=4, priority=1, queue="lo", arrival=0, duration=10,
+                 affinity=(("zone", "c"),), tolerations=("gpu",)),
+            task("hiB", cpu=4, memory=4, priority=5, queue="hi", arrival=1, duration=2,
+                 affinity=(("zone", "b"),)),
+            task("hiAnti", cpu=4, memory=4, priority=9, queue="hi", arrival=2, duration=2,
+                 anti_affinity=("spot",)),
+            task("hiG", cpu=4, memory=4, priority=5, queue="hi", arrival=2, duration=2,
+                 affinity=(("zone", "c"),), tolerations=("gpu",)),
+        ),
+        {"lo": 1, "hi": 2},
+        {"lo": (12, 12), "hi": (8, 8)},
+    )
+
+
 SCENARIOS = (
     scenario_staggered(),
     scenario_memory_bound(),
     scenario_preemption(),
+    scenario_preemption_constraints(),
     scenario_backfill(),
     scenario_fair(),
 )
@@ -304,12 +339,28 @@ def oracle_quota_reason(task_: Task, running: list[int], limit: list[int]) -> st
     )
 
 
-def oracle_victims(task_: Task, node_id: str, intervals, tasks_by_id, free, clock: int):
-    """The smallest set of lower-priority running tasks whose eviction fits ``task_``."""
+def oracle_victims(task_: Task, node: Node, intervals, tasks_by_id, free, clock: int):
+    """The smallest set of lower-priority running tasks whose eviction fits ``task_``.
+
+    Preemption can only buy resources, never compatibility: a node that fails the static
+    predicates (affinity, anti-affinity, taints) supplies no victims, exactly as it would reject
+    the task in ordinary placement. The capacity failure itself is not checked here -- freeing
+    room is the whole point of the eviction.
+    """
+    labels = node.label_map()
+    for key, value in task_.affinity:
+        if labels.get(key) != value:
+            return None
+    for key in task_.anti_affinity:
+        if key in labels:
+            return None
+    for taint in node.taints:
+        if taint not in task_.tolerations:
+            return None
     candidates = [
         item
         for item in intervals
-        if item.node_id == node_id
+        if item.node_id == node.id
         and item.start <= clock < item.end
         and tasks_by_id[item.task_id].priority < task_.priority
     ]
@@ -321,7 +372,7 @@ def oracle_victims(task_: Task, node_id: str, intervals, tasks_by_id, free, cloc
             item.task_id,
         )
     )
-    cpu, memory = free[node_id]
+    cpu, memory = free[node.id]
     chosen: list[str] = []
     for item in candidates:
         chosen.append(item.task_id)
@@ -465,7 +516,7 @@ def check_run(tc: unittest.TestCase, scenario: Scenario, options: dict, result) 
                     )
                     if allow_preemption and head.priority > 0:
                         tc.assertIsNone(
-                            oracle_victims(head, node.id, decided, tasks_by_id, free, clock),
+                            oracle_victims(head, node, decided, tasks_by_id, free, clock),
                             f"jumped head {head.id} could have been placed by preemption",
                         )
             running_ends = [item.end for item in decided if item.start <= clock < item.end]
@@ -499,13 +550,25 @@ def check_run(tc: unittest.TestCase, scenario: Scenario, options: dict, result) 
                 tc.assertIsNotNone(oracle_first_failure(current, node, *free[node.id]))
             expected = None
             for node in sorted(nodes, key=lambda n: n.id):
-                victims = oracle_victims(current, node.id, decided, tasks_by_id, free, clock)
+                victims = oracle_victims(current, node, decided, tasks_by_id, free, clock)
                 if victims:
                     expected = (node.id, victims)
                     break
-            tc.assertIsNotNone(expected, "preemption recorded but no node can supply victims")
+            tc.assertIsNotNone(expected, "preemption recorded but no compatible node can supply victims")
             tc.assertEqual(entry["node"], expected[0])
             tc.assertEqual(reason, f"preempting {len(expected[1])} lower-priority task(s) on {expected[0]}")
+            # the chosen node must be one ordinary placement's static predicates accept: preemption
+            # never lands on a node the task could not have used with capacity to spare
+            chosen_node = next(node for node in nodes if node.id == expected[0])
+            tc.assertIsNone(
+                oracle_first_failure(
+                    current,
+                    chosen_node,
+                    current.request.cpu,
+                    current.request.memory,
+                ),
+                "preemption landed on a node that fails affinity, anti-affinity or taints",
+            )
             placement = next(p for p in result.placements if p.task_id == current.id)
             tc.assertEqual(list(placement.preempted), sorted(expected[1]))
             for victim_id in expected[1]:
@@ -694,6 +757,43 @@ class ScenarioContentTests(unittest.TestCase):
         self.assertEqual(queues["lo"]["cpuTime"], 2 * 1 + 2 * 2 + 2 * 10)
         self.assertEqual(queues["lo"]["memoryTime"], 2 * 1 + 2 * 2 + 2 * 10)
         self.assertEqual(queues["hi"]["cpuTime"], 2 * 2 + 1 * 1 + 4 * 1)
+
+    def test_preemption_respects_affinity_anti_affinity_and_taints(self) -> None:
+        scenario = scenario_preemption_constraints()
+        result = simulate(scenario.nodes, scenario.tasks, allow_preemption=True)
+        intervals = {p.task_id: (p.start, p.end) for p in result.placements}
+        by_task = {p.task_id: p for p in result.placements}
+        # The smallest-id node n1 carries the spot label hiAnti forbids and lacks zone=b/zone=c:
+        # every high-priority task skips it, and its victim lowA is never evicted.
+        self.assertEqual(intervals["lowA"], (0, 10))
+        self.assertEqual(by_task["hiB"].node_id, "n2")
+        self.assertEqual(by_task["hiB"].preempted, ("lowB",))
+        self.assertEqual(intervals["lowB"], (0, 1))
+        # hiAnti passes n1 untouched, takes n2 (also spot-free) by id order and even evicts the
+        # lower-priority hiB it finds there -- strict priority ordering is unchanged.
+        self.assertEqual(by_task["hiAnti"].node_id, "n2")
+        self.assertEqual(by_task["hiAnti"].preempted, ("hiB",))
+        self.assertEqual(intervals["hiB"], (1, 2))
+        # hiG tolerates the gpu taint and pins zone=c: only n3 is compatible, and lowG goes there.
+        self.assertEqual(by_task["hiG"].node_id, "n3")
+        self.assertEqual(by_task["hiG"].preempted, ("lowG",))
+        self.assertEqual(result.metrics["preemptions"], 3)
+        # every preempted interval ends exactly at the eviction tick; the trace carries no ghosts
+        preempted_ids = {victim for p in result.placements for victim in p.preempted}
+        self.assertEqual(preempted_ids, {"lowB", "hiB", "lowG"})
+
+    def test_constraint_blocked_preemption_waits_without_evicting_when_off(self) -> None:
+        scenario = scenario_preemption_constraints()
+        result = simulate(scenario.nodes, scenario.tasks)
+        # With preemption disabled nothing is evicted; all three high-priority tasks still start,
+        # after the natural completions, and end placed.
+        self.assertEqual(result.metrics["preemptions"], 0)
+        self.assertEqual(result.unplaced, [])
+        intervals = {p.task_id: (p.start, p.end) for p in result.placements}
+        self.assertEqual(intervals["hiAnti"], (10, 12))
+        self.assertEqual(intervals["hiG"], (10, 12))
+        self.assertEqual(intervals["hiB"], (12, 14))
+        self.assertEqual(intervals["lowA"], (0, 10))
 
     def test_backfill_fires_and_respects_the_horizon(self) -> None:
         scenario = scenario_backfill()

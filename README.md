@@ -143,7 +143,18 @@ same configuration as a mapping, `queue_quotas={"team-a": Resources(8, 16)}`.
 * **Preemption is conservative and minimal.** Only strictly lower priorities are eligible, they are
   ordered lowest-priority-first and then largest-request-first, and the search stops as soon as the
   incoming task fits. When even evicting everything would not free enough, the request is refused with
-  that sentence instead of evicting and still failing.
+  that sentence instead of evicting and still failing. Preemption buys resources, never
+  compatibility: victims are searched only on nodes that already satisfy the task's affinity,
+  anti-affinity and taint tolerations -- the very same predicates ordinary placement applies, in
+  the same order -- so ordinary and preemptive placement give the same answer for one task/node
+  pair. The node walk stays the deterministic id order; a smaller-id node whose resources *could*
+  be freed but which misses an affinity label, carries an anti-affinity label or holds an
+  untolerated taint is skipped without evicting anything on it, and the search continues on the
+  next compatible node. If no compatible node can hold the request even after evicting every
+  strictly lower-priority task, the task simply waits and is retried on the existing clock as
+  resources release; at the end of the run it lands in `unplaced` (exit **3**) with the ordinary
+  `no node fits` refusal and no preemption record. The `preemptions` metric counts only evictions
+  that actually happened.
 * **Capacity is never over-committed.** The test suite re-walks a schedule tick by tick and asserts the
   sum of concurrent requests fits each node.
 * **Backfill is bounded.** When the waiting head cannot be placed, and only then, the scheduler

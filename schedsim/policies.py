@@ -4,6 +4,12 @@ Predicates are pure functions returning `(ok, reason)`: a rejection that cannot 
 when a schedule looks wrong, so every branch names the constraint it hit. Node selection is
 deterministic -- ties always break on node id -- and preemption picks the *smallest* set of the
 lowest-priority tasks that makes the incoming task fit.
+
+Preemption buys room, never legitimacy: it searches only nodes that already satisfy the static
+placement constraints (affinity, anti-affinity, taints), the same predicates ordinary placement
+applies. A temporary resource shortage can be solved by an eviction; a missing or mismatched
+affinity label, a present anti-affinity label or an untolerated taint cannot, so such a node is
+skipped without evicting anything that runs on it.
 """
 
 from __future__ import annotations
@@ -56,6 +62,20 @@ def taint_predicate(task: Task, node: Node) -> tuple[bool, str]:
     return True, "taints ok"
 
 
+def static_constraints(task: Task, node: Node) -> tuple[bool, str]:
+    """The placement constraints an eviction can never change, in the documented predicate order.
+
+    Capacity is deliberately absent: a resource shortage is exactly what preemption exists to
+    resolve. Affinity, anti-affinity and taints are properties of the task and the node itself, so
+    ordinary placement and a preempting placement must reach the same conclusion about them for the
+    same task/node pair. The failure reason is the one ``fits`` would report on that node.
+    """
+    ok, reason = affinity_predicate(task, node)
+    if not ok:
+        return False, reason
+    return taint_predicate(task, node)
+
+
 PREDICATES = (capacity_predicate, affinity_predicate, taint_predicate)
 
 
@@ -65,10 +85,7 @@ def fits(cluster: Cluster, task: Task, node: Node) -> tuple[bool, str]:
     ok, reason = capacity_predicate(task, free)
     if not ok:
         return False, reason
-    ok, reason = affinity_predicate(task, node)
-    if not ok:
-        return False, reason
-    return taint_predicate(task, node)
+    return static_constraints(task, node)
 
 
 def order_candidates(cluster: Cluster, policy: str) -> list[Node]:
@@ -107,12 +124,20 @@ def preemption_candidates(
 ) -> tuple[list[Placement], str]:
     """The smallest set of lower-priority running tasks whose eviction frees room for `task`.
 
+    The static placement constraints are checked first and shared verbatim with ordinary
+    placement: a node that misses an affinity label, carries an anti-affinity label or holds a
+    taint the task does not tolerate returns no candidates, so the caller never evicts anything on
+    it and moves on to the next compatible node -- preemption cannot buy compatibility.
+
     Candidates are ordered lowest priority first, then largest request, then task id, and the search
     stops as soon as the request fits -- so the answer is deterministic and is never larger than needed.
     A task is never a candidate for eviction of something at its own priority or higher.
     """
     if task.priority <= 0:
         return [], "preemption only applies to positive priorities"
+    ok, reason = static_constraints(task, node)
+    if not ok:
+        return [], reason
     clock_free = cluster.free(node.id)
     if task.request.fits(clock_free):
         return [], "no preemption needed"

@@ -398,6 +398,12 @@ class Simulation:
         if not self.allow_preemption:
             self._record_refusal(task, decision.reason, clock, context)
             return False
+        # Nodes are probed in the deterministic id order. A node that cannot help yields no victims
+        # and is skipped without any side effect: this covers both a resource shortage that even
+        # evicting every strictly-lower-priority task could not close, AND a static mismatch --
+        # missing/wrong affinity, an anti-affinity label, an untolerated taint -- which the shared
+        # predicates forbid just as they do in `select_node`. Nothing on a skipped node is evicted;
+        # the search continues on the next compatible node.
         for node in sorted(self._cluster.nodes, key=lambda item: item.id):
             chosen, reason = preemption_candidates(self._cluster, task, node, self._placements, self.task_index, clock)
             if not chosen:
