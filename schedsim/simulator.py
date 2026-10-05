@@ -17,6 +17,7 @@ recomputed after every release, placement and preemption. Without that mapping, 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from fractions import Fraction
 
 from .errors import ValidationError
 from .model import Cluster, Node, Placement, Resources, Task
@@ -93,12 +94,14 @@ class Simulation:
         assert self.queue_weights is not None
         return self.queue_weights.get(queue, 1)
 
-    def _shares(self, clock: int) -> dict[str, float]:
+    def _shares(self, clock: int) -> dict[str, Fraction]:
         """Weighted dominant share of every queue from the tasks running at ``clock``.
 
         The dominant resource is the larger of the queue's CPU and memory fractions of total cluster
         capacity; dividing by the queue weight yields its weighted dominant share. Shares are exact
-        ratios for ordering and are rounded only when they enter a trace document.
+        ratios for ordering -- two queues whose shares differ by less than binary floating point can
+        resolve still sort by the mathematical value -- and are rounded only when they enter a trace
+        document.
         """
         assert self.queue_weights is not None
         running = self._active(clock)
@@ -107,10 +110,10 @@ class Simulation:
             queue = self.task_index[item.task_id].queue
             used[queue] = used.get(queue, Resources(0, 0)).plus(self.task_index[item.task_id].request)
         capacity = self._cluster.total_capacity()
-        shares: dict[str, float] = {}
+        shares: dict[str, Fraction] = {}
         for queue, request in used.items():
-            cpu_fraction = request.cpu / capacity.cpu if capacity.cpu else 0.0
-            memory_fraction = request.memory / capacity.memory if capacity.memory else 0.0
+            cpu_fraction = Fraction(request.cpu, capacity.cpu) if capacity.cpu else Fraction(0)
+            memory_fraction = Fraction(request.memory, capacity.memory) if capacity.memory else Fraction(0)
             shares[queue] = max(cpu_fraction, memory_fraction) / self._weight(queue)
         return shares
 
@@ -122,7 +125,7 @@ class Simulation:
             pending,
             key=lambda task: (
                 -task.priority,
-                shares.get(task.queue, 0.0),
+                shares.get(task.queue, Fraction(0)),
                 task.arrival,
                 task.queue,
                 task.id,
@@ -275,7 +278,7 @@ class Simulation:
         return {
             "queue": task.queue,
             "weight": self._weight(task.queue),
-            "weightedDominantShare": round(shares.get(task.queue, 0.0), 6),
+            "weightedDominantShare": round(float(shares.get(task.queue, Fraction(0))), 6),
         }
 
     def _annotate(self, document: dict[str, object], context: dict[str, object]) -> dict[str, object]:
@@ -392,8 +395,10 @@ class Simulation:
         report: dict[str, object] = {}
         for name in sorted(names):
             queue_waits = waits.get(name, [])
-            cpu_share = cpu_time.get(name, 0) / (cpu_capacity * makespan) if cpu_capacity and makespan else 0.0
-            memory_share = memory_time.get(name, 0) / (memory_capacity * makespan) if memory_capacity and makespan else 0.0
+            cpu_share = Fraction(cpu_time.get(name, 0), cpu_capacity * makespan) if cpu_capacity and makespan else Fraction(0)
+            memory_share = (
+                Fraction(memory_time.get(name, 0), memory_capacity * makespan) if memory_capacity and makespan else Fraction(0)
+            )
             report[name] = {
                 "weight": self._weight(name),
                 "placed": len(queue_waits),
@@ -401,7 +406,7 @@ class Simulation:
                 "averageWait": round(sum(queue_waits) / len(queue_waits), 3) if queue_waits else 0.0,
                 "cpuTime": cpu_time.get(name, 0),
                 "memoryTime": memory_time.get(name, 0),
-                "dominantShare": round(max(cpu_share, memory_share) / self._weight(name), 6),
+                "dominantShare": round(float(max(cpu_share, memory_share) / self._weight(name)), 6),
             }
         return report
 
