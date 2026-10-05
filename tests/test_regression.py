@@ -151,10 +151,57 @@ def scenario_fair() -> Scenario:
     )
 
 
+def scenario_preemption_constrained() -> Scenario:
+    """Preemption must respect the same static predicates as ordinary placement.
+
+    Four identical nodes differ only in labels and taints. Low-priority tasks fill every node, so
+    resource-wise an eviction would work on any of them; the incoming high-priority tasks may only
+    take victims on nodes that pass affinity, anti-affinity and taints. The lowest-id node n1 is
+    always preemptable in resources but always fails affinity, so it must be skipped and its task
+    left untouched:
+
+    * n1 zone=a              -- ``hi`` wants zone=b: affinity miss, skipped despite being first id;
+    * n2 zone=b              -- the only compatible node at tick 1, ``low2`` is the victim;
+    * n3 zone=b + spot label -- skipped by anti-affinity for tasks that forbid ``spot``;
+    * n4 zone=b + gpu taint  -- skipped while the taint is untolerated, usable once tolerated.
+
+    A later task that no compatible node can free room for waits on the clock and lands only when a
+    compatible node releases naturally -- the trace must never show an eviction from n1/n3/n4.
+    """
+    return Scenario(
+        "preemption-constrained",
+        (
+            Node("n1", Resources(4, 4), labels=(("zone", "a"),)),
+            Node("n2", Resources(4, 4), labels=(("zone", "b"),)),
+            Node("n3", Resources(4, 4), labels=(("zone", "b"), ("spot", "x"))),
+            Node("n4", Resources(4, 4), labels=(("zone", "b"),), taints=("gpu",)),
+        ),
+        (
+            task("low1", cpu=4, memory=4, priority=1, queue="lo", arrival=0, duration=10),
+            task("low2", cpu=4, memory=4, priority=1, queue="lo", arrival=0, duration=10),
+            task("low3", cpu=4, memory=4, priority=1, queue="lo", arrival=0, duration=10),
+            task("low4", cpu=4, memory=4, priority=1, queue="lo", arrival=0, duration=10, tolerations=("gpu",)),
+            task("hi", cpu=4, memory=4, priority=9, queue="hi", arrival=1, duration=1,
+                 affinity=(("zone", "b"),), anti_affinity=("spot",)),
+            task("hi2", cpu=4, memory=4, priority=9, queue="hi", arrival=2, duration=4,
+                 affinity=(("zone", "b"),), anti_affinity=("spot",)),
+            task("hiT", cpu=4, memory=4, priority=9, queue="hi", arrival=2, duration=2,
+                 affinity=(("zone", "b"),), anti_affinity=("spot",), tolerations=("gpu",)),
+            task("hiS", cpu=4, memory=4, priority=9, queue="hi", arrival=3, duration=1,
+                 affinity=(("zone", "b"),)),
+            task("hiU", cpu=4, memory=4, priority=9, queue="hi", arrival=3, duration=2,
+                 affinity=(("zone", "b"),), anti_affinity=("spot",)),
+        ),
+        {"lo": 1, "hi": 2},
+        {"lo": (20, 20), "hi": (20, 20)},
+    )
+
+
 SCENARIOS = (
     scenario_staggered(),
     scenario_memory_bound(),
     scenario_preemption(),
+    scenario_preemption_constrained(),
     scenario_backfill(),
     scenario_fair(),
 )
@@ -205,13 +252,13 @@ def oracle_free(nodes: tuple[Node, ...], requests: dict[str, Resources], interva
     return free
 
 
-def oracle_first_failure(task_: Task, node: Node, free_cpu: int, free_memory: int) -> str | None:
-    """The first predicate failure, in the documented predicate order, or None."""
-    if task_.request.cpu > free_cpu or task_.request.memory > free_memory:
-        return (
-            f"insufficient capacity: needs cpu={task_.request.cpu},memory={task_.request.memory} "
-            f"has cpu={free_cpu},memory={free_memory}"
-        )
+def oracle_static_failure(task_: Task, node: Node) -> str | None:
+    """The affinity / anti-affinity / taint failure -- the constraints an eviction can never fix.
+
+    Mirrors the product's static predicate gate: preemption only buys resources, so a node whose
+    labels or taints reject the task may never supply victims, no matter how much an eviction would
+    free. Capacity is deliberately absent: it is the one predicate a preemption is allowed to fix.
+    """
     labels = node.label_map()
     for key, value in task_.affinity:
         if labels.get(key) != value:
@@ -223,6 +270,16 @@ def oracle_first_failure(task_: Task, node: Node, free_cpu: int, free_memory: in
         if taint not in task_.tolerations:
             return f"untolerated taint {taint}"
     return None
+
+
+def oracle_first_failure(task_: Task, node: Node, free_cpu: int, free_memory: int) -> str | None:
+    """The first predicate failure, in the documented predicate order, or None."""
+    if task_.request.cpu > free_cpu or task_.request.memory > free_memory:
+        return (
+            f"insufficient capacity: needs cpu={task_.request.cpu},memory={task_.request.memory} "
+            f"has cpu={free_cpu},memory={free_memory}"
+        )
+    return oracle_static_failure(task_, node)
 
 
 def oracle_node_order(nodes: tuple[Node, ...], free: dict[str, list[int]], policy: str) -> list[Node]:
@@ -304,8 +361,16 @@ def oracle_quota_reason(task_: Task, running: list[int], limit: list[int]) -> st
     )
 
 
-def oracle_victims(task_: Task, node_id: str, intervals, tasks_by_id, free, clock: int):
-    """The smallest set of lower-priority running tasks whose eviction fits ``task_``."""
+def oracle_victims(task_: Task, node_id: str, intervals, tasks_by_id, free, clock: int, nodes_by_id=None):
+    """The smallest set of lower-priority running tasks whose eviction fits ``task_``.
+
+    A node that fails a static placement constraint (affinity, anti-affinity, taints) returns no
+    victims under any occupancy: evictions buy resources, never labels, so such a node is skipped
+    exactly as normal placement would skip it.
+    """
+    if nodes_by_id is not None:
+        if oracle_static_failure(task_, nodes_by_id[node_id]) is not None:
+            return None
     candidates = [
         item
         for item in intervals
@@ -343,6 +408,7 @@ def check_run(tc: unittest.TestCase, scenario: Scenario, options: dict, result) 
     quota_rows: dict[str, tuple[int, int]] = scenario.quotas if "queue_quotas" in options else {}
     tasks_by_id = {t.id: t for t in tasks}
     requests = {t.id: t.request for t in tasks}
+    nodes_by_id = {node.id: node for node in nodes}
     node_ids = {node.id for node in nodes}
     total_cpu = sum(node.capacity.cpu for node in nodes)
     total_memory = sum(node.capacity.memory for node in nodes)
@@ -465,7 +531,7 @@ def check_run(tc: unittest.TestCase, scenario: Scenario, options: dict, result) 
                     )
                     if allow_preemption and head.priority > 0:
                         tc.assertIsNone(
-                            oracle_victims(head, node.id, decided, tasks_by_id, free, clock),
+                            oracle_victims(head, node.id, decided, tasks_by_id, free, clock, nodes_by_id),
                             f"jumped head {head.id} could have been placed by preemption",
                         )
             running_ends = [item.end for item in decided if item.start <= clock < item.end]
@@ -499,12 +565,16 @@ def check_run(tc: unittest.TestCase, scenario: Scenario, options: dict, result) 
                 tc.assertIsNotNone(oracle_first_failure(current, node, *free[node.id]))
             expected = None
             for node in sorted(nodes, key=lambda n: n.id):
-                victims = oracle_victims(current, node.id, decided, tasks_by_id, free, clock)
+                victims = oracle_victims(
+                    current, node.id, decided, tasks_by_id, free, clock, nodes_by_id
+                )
                 if victims:
                     expected = (node.id, victims)
                     break
             tc.assertIsNotNone(expected, "preemption recorded but no node can supply victims")
             tc.assertEqual(entry["node"], expected[0])
+            # the node actually used passes the same static predicates as ordinary placement
+            tc.assertIsNone(oracle_static_failure(current, nodes_by_id[expected[0]]))
             tc.assertEqual(reason, f"preempting {len(expected[1])} lower-priority task(s) on {expected[0]}")
             placement = next(p for p in result.placements if p.task_id == current.id)
             tc.assertEqual(list(placement.preempted), sorted(expected[1]))
@@ -694,6 +764,46 @@ class ScenarioContentTests(unittest.TestCase):
         self.assertEqual(queues["lo"]["cpuTime"], 2 * 1 + 2 * 2 + 2 * 10)
         self.assertEqual(queues["lo"]["memoryTime"], 2 * 1 + 2 * 2 + 2 * 10)
         self.assertEqual(queues["hi"]["cpuTime"], 2 * 2 + 1 * 1 + 4 * 1)
+
+    def test_preemption_respects_affinity_anti_affinity_and_taints(self) -> None:
+        scenario = scenario_preemption_constrained()
+        result = simulate(scenario.nodes, scenario.tasks, allow_preemption=True)
+        intervals = {p.task_id: p for p in result.placements}
+        # n1 is the lowest id and resource-wise the first place an eviction would free room, but its
+        # zone=a label fails every incoming task's zone=b affinity: low1 must never be touched.
+        self.assertEqual((intervals["low1"].start, intervals["low1"].end), (0, 10))
+        self.assertEqual(intervals["low1"].preempted, ())
+        self.assertFalse(any("low1" in p.preempted for p in result.placements))
+        # the first compatible node in id order is n2 -> low2 is the single minimal victim there
+        self.assertEqual(intervals["hi"].node_id, "n2")
+        self.assertEqual(intervals["hi"].preempted, ("low2",))
+        self.assertEqual(intervals["low2"].end, 1)
+        # n3 carries spot and is skipped by anti-affinity while a clean node exists...
+        self.assertNotIn(intervals["hi"].node_id, {"n1", "n3", "n4"})
+        # ...but a task that does not forbid spot may take a victim there later
+        self.assertEqual(intervals["hiS"].node_id, "n3")
+        self.assertEqual(intervals["hiS"].preempted, ("low3",))
+        # n4's gpu taint excludes every task without the toleration, and admits hiT which has it
+        self.assertEqual(intervals["hiT"].node_id, "n4")
+        self.assertEqual(intervals["hiT"].preempted, ("low4",))
+        # hiU tolerates no taint and forbids spot: its only compatible node is n2, which an equal
+        # priority task holds until 6, so it waits on the clock and never evicts n1/n3/n4
+        self.assertEqual((intervals["hiU"].node_id, intervals["hiU"].start), ("n2", 6))
+        self.assertEqual(intervals["hiU"].preempted, ())
+        # exactly the three compatible-node evictions are counted; nothing is ever unplaced
+        self.assertEqual(result.metrics["preemptions"], 3)
+        self.assertEqual(result.unplaced, [])
+        victims = {victim for p in result.placements for victim in p.preempted}
+        self.assertEqual(victims, {"low2", "low3", "low4"})
+
+    def test_constrained_preemption_without_the_flag_evicts_nothing(self) -> None:
+        scenario = scenario_preemption_constrained()
+        by_id = {t.id: t for t in scenario.tasks}
+        result = simulate(scenario.nodes, scenario.tasks)
+        self.assertEqual(result.metrics["preemptions"], 0)
+        for p in result.placements:
+            self.assertEqual(p.preempted, ())
+            self.assertEqual(p.end - p.start, by_id[p.task_id].duration)
 
     def test_backfill_fires_and_respects_the_horizon(self) -> None:
         scenario = scenario_backfill()

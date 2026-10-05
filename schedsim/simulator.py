@@ -24,6 +24,12 @@ ceiling can never be bypassed by an eviction, because preemption is only searche
 admits the request. Finishing and evicted tasks release their usage immediately, so a later
 decision at the same tick sees it. Backfill may jump a quota-blocked head for the first later
 candidate whose own queue quota still admits it. Without that mapping, nothing changes.
+
+Preemption only buys resources: the victim search applies the same static predicates as ordinary
+placement (affinity, anti-affinity, taints), so a node those predicates reject supplies no victims
+regardless of how much room an eviction would free -- the scheduler moves on to the next compatible
+node in id order instead of evicting first and asking later. Without ``--preemption`` nothing here
+runs at all.
 """
 
 from __future__ import annotations
@@ -401,6 +407,10 @@ class Simulation:
         for node in sorted(self._cluster.nodes, key=lambda item: item.id):
             chosen, reason = preemption_candidates(self._cluster, task, node, self._placements, self.task_index, clock)
             if not chosen:
+                # A node may have lower-priority tasks whose eviction would free room and still be
+                # skipped: affinity, anti-affinity and taints are static, shared with ordinary
+                # placement, and a preemption can never satisfy them. No task on such a node is
+                # touched; the search continues with the next node in id order.
                 continue
             for item in chosen:
                 index = self._placements.index(item)

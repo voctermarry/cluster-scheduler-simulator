@@ -157,6 +157,72 @@ class PreemptionTests(unittest.TestCase):
         self.assertEqual(chosen, [])
         self.assertIn("would not fit", reason)
 
+    def test_affinity_miss_blocks_preemption_even_when_eviction_would_fit(self) -> None:
+        from schedsim import Placement
+
+        node = Node("n1", self.capacity, labels=(("zone", "a"),))
+        cluster = Cluster((node,))
+        cluster.occupy("n1", self.low.request)
+        pinned = task("pinned", cpu=4, memory=4, priority=9, affinity=(("zone", "b"),))
+        placements = [Placement("low", "n1", 0, 10)]
+        chosen, reason = preemption_candidates(cluster, pinned, node, placements, {"low": self.low}, 1)
+        self.assertEqual(chosen, [])
+        self.assertIn("cannot bypass placement constraints", reason)
+        self.assertIn("affinity", reason)
+
+    def test_affinity_value_mismatch_blocks_preemption(self) -> None:
+        node = Node("n1", self.capacity, labels=(("zone", "a"),))
+        cluster = Cluster((node,))
+        cluster.occupy("n1", self.low.request)
+        pinned = task("pinned", cpu=1, priority=9, affinity=(("zone", "b"),))
+        from schedsim import Placement
+
+        chosen, _ = preemption_candidates(
+            cluster, pinned, node, [Placement("low", "n1", 0, 10)], {"low": self.low}, 1
+        )
+        self.assertEqual(chosen, [])
+
+    def test_anti_affinity_blocks_preemption(self) -> None:
+        from schedsim import Placement
+
+        node = Node("n1", self.capacity, labels=(("spot", "yes"),))
+        cluster = Cluster((node,))
+        cluster.occupy("n1", self.low.request)
+        picky = task("picky", cpu=4, memory=4, priority=9, anti_affinity=("spot",))
+        chosen, reason = preemption_candidates(
+            cluster, picky, node, [Placement("low", "n1", 0, 10)], {"low": self.low}, 1
+        )
+        self.assertEqual(chosen, [])
+        self.assertIn("anti-affinity", reason)
+
+    def test_untolerated_taint_blocks_preemption(self) -> None:
+        from schedsim import Placement
+
+        node = Node("n1", self.capacity, taints=("gpu",))
+        cluster = Cluster((node,))
+        cluster.occupy("n1", self.low.request)
+        high = task("high", cpu=4, memory=4, priority=9)
+        chosen, reason = preemption_candidates(
+            cluster, high, node, [Placement("low", "n1", 0, 10)], {"low": self.low}, 1
+        )
+        self.assertEqual(chosen, [])
+        self.assertIn("untolerated taint", reason)
+
+    def test_tolerated_taint_still_allows_preemption(self) -> None:
+        from schedsim import Placement
+
+        node = Node("n1", self.capacity, taints=("gpu",))
+        cluster = Cluster((node,))
+        cluster.occupy("n1", self.low.request)
+        cluster.occupy("n1", self.mid.request)
+        # free 2x2; evicting low (4x4) reaches exactly 6x6, the minimal one-victim set
+        high = task("high", cpu=6, memory=6, priority=9, tolerations=("gpu",))
+        placements = [Placement("low", "n1", 0, 10), Placement("mid", "n1", 0, 10)]
+        chosen, _ = preemption_candidates(
+            cluster, high, node, placements, {"low": self.low, "mid": self.mid}, 1
+        )
+        self.assertEqual([item.task_id for item in chosen], ["low"])
+
 
 class SimulationTests(unittest.TestCase):
     def test_simple_schedule_places_everything_and_never_overcommits(self) -> None:
@@ -385,6 +451,116 @@ class SimulationTests(unittest.TestCase):
         high_with = {item.task_id: item for item in with_preemption.placements}["high"]
         self.assertGreater(high_without.start, high_with.start)
         self.assertEqual(with_preemption.metrics["preemptions"], 1)
+
+    def test_preemption_skips_a_smaller_id_node_that_fails_affinity(self) -> None:
+        # n1 is first in id order and an eviction there would free room, but its zone=a label fails
+        # the incoming task's zone=b affinity: nothing on n1 may be touched, and the compatible n2
+        # supplies the minimal victim set instead.
+        cluster_nodes = (
+            Node("n1", Resources(4, 4), labels=(("zone", "a"),)),
+            Node("n2", Resources(4, 4), labels=(("zone", "b"),)),
+        )
+        tasks = (
+            task("lowA", cpu=4, memory=4, priority=1, duration=10),
+            task("lowB", cpu=4, memory=4, priority=1, duration=10, tolerations=("gpu",)),
+            task("high", cpu=4, memory=4, priority=9, duration=1, arrival=1,
+                 affinity=(("zone", "b"),)),
+        )
+        result = simulate(cluster_nodes, tasks, allow_preemption=True)
+        placed = {item.task_id: item for item in result.placements}
+        self.assertEqual((placed["lowA"].start, placed["lowA"].end), (0, 10))
+        self.assertEqual(placed["lowA"].preempted, ())
+        self.assertEqual(placed["high"].node_id, "n2")
+        self.assertEqual(placed["high"].preempted, ("lowB",))
+        self.assertEqual(placed["lowB"].end, 1)
+        self.assertEqual(result.metrics["preemptions"], 1)
+        decision = next(entry for entry in result.decisions if entry["task"] == "high")
+        self.assertEqual(decision["node"], "n2")
+        self.assertEqual(decision["reason"], "preempting 1 lower-priority task(s) on n2")
+
+    def test_preemption_skips_anti_affinity_and_untolerated_taint_nodes(self) -> None:
+        cluster_nodes = (
+            Node("n1", Resources(4, 4), labels=(("zone", "b"), ("spot", "x"))),
+            Node("n2", Resources(4, 4), labels=(("zone", "b"),), taints=("gpu",)),
+            Node("n3", Resources(4, 4), labels=(("zone", "b"),)),
+        )
+        tasks = (
+            task("low1", cpu=4, memory=4, priority=1, duration=10),
+            task("low2", cpu=4, memory=4, priority=1, duration=10, tolerations=("gpu",)),
+            task("low3", cpu=4, memory=4, priority=1, duration=10),
+            task("high", cpu=4, memory=4, priority=9, duration=1, arrival=1,
+                 affinity=(("zone", "b"),), anti_affinity=("spot",)),
+        )
+        result = simulate(cluster_nodes, tasks, allow_preemption=True)
+        high = next(item for item in result.placements if item.task_id == "high")
+        self.assertEqual(high.node_id, "n3")
+        self.assertEqual(high.preempted, ("low3",))
+        self.assertEqual(result.metrics["preemptions"], 1)
+        for untouched in ("low1", "low2"):
+            victim = next(item for item in result.placements if item.task_id == untouched)
+            self.assertEqual((victim.start, victim.end), (0, 10))
+
+    def test_task_with_no_compatible_node_waits_retries_and_is_unplaced_without_evictions(self) -> None:
+        # The single node fails affinity for the whole run. At tick 1 capacity is the first
+        # failure; after the low task finishes at tick 3 affinity fails on the empty node, proving
+        # the static conclusion does not depend on occupancy. No task is ever evicted.
+        cluster_nodes = (Node("n1", Resources(4, 4), labels=(("zone", "a"),)),)
+        tasks = (
+            task("low", cpu=4, memory=4, priority=1, duration=3),
+            task("high", cpu=4, memory=4, priority=9, duration=1, arrival=1,
+                 affinity=(("zone", "b"),)),
+        )
+        result = simulate(cluster_nodes, tasks, allow_preemption=True)
+        self.assertEqual(result.unplaced, ["high"])
+        self.assertFalse(any(item.task_id == "high" for item in result.placements))
+        self.assertEqual(result.metrics["preemptions"], 0)
+        low = next(item for item in result.placements if item.task_id == "low")
+        self.assertEqual((low.start, low.end, low.preempted), (0, 3, ()))
+        high_entries = [entry for entry in result.decisions if entry["task"] == "high"]
+        refusal = [entry for entry in high_entries if "at" in entry]
+        self.assertTrue(refusal)
+        self.assertTrue(all(entry["reason"].startswith("no node fits") for entry in refusal))
+        self.assertTrue(any("affinity zone=b" in entry["reason"] for entry in refusal))
+        self.assertFalse(any("preempt" in str(entry["reason"]) for entry in result.decisions))
+
+    def test_constraint_blocked_task_waits_for_a_natural_release_on_a_compatible_node(self) -> None:
+        # The compatible node n2 is held by an equal-priority (non-evictable) task until tick 2;
+        # incompatible n1 holds an evictable low-priority task but must never supply it. The high
+        # task waits on the clock and lands at tick 2 with zero preemptions.
+        cluster_nodes = (
+            Node("n1", Resources(4, 4), labels=(("zone", "a"),)),
+            Node("n2", Resources(4, 4), labels=(("zone", "b"),)),
+        )
+        tasks = (
+            task("lowA", cpu=4, memory=4, priority=1, duration=10),
+            task("peerB", cpu=4, memory=4, priority=9, duration=2, affinity=(("zone", "b"),)),
+            task("high", cpu=4, memory=4, priority=9, duration=1, arrival=1,
+                 affinity=(("zone", "b"),)),
+        )
+        result = simulate(cluster_nodes, tasks, allow_preemption=True)
+        high = next(item for item in result.placements if item.task_id == "high")
+        self.assertEqual((high.node_id, high.start, high.preempted), ("n2", 2, ()))
+        self.assertEqual(result.metrics["preemptions"], 0)
+        self.assertEqual(next(item for item in result.placements if item.task_id == "lowA").end, 10)
+
+    def test_preemption_constraint_gate_is_deterministic_under_replay(self) -> None:
+        cluster_nodes = (
+            Node("n1", Resources(4, 4), taints=("gpu",)),
+            Node("n2", Resources(4, 4), labels=(("zone", "b"),)),
+            Node("n3", Resources(4, 4), labels=(("zone", "a"),)),
+        )
+        tasks = (
+            task("low1", cpu=4, memory=4, priority=1, duration=10, tolerations=("gpu",)),
+            task("low2", cpu=4, memory=4, priority=1, duration=10),
+            task("low3", cpu=4, memory=4, priority=1, duration=10),
+            task("high", cpu=4, memory=4, priority=9, duration=1, arrival=1,
+                 affinity=(("zone", "b"),)),
+        )
+        options = {"allow_preemption": True}
+        report = replay(cluster_nodes, tasks, **options)
+        self.assertTrue(report["identical"])
+        result = simulate(cluster_nodes, tasks, **options)
+        self.assertEqual(next(p for p in result.placements if p.task_id == "high").node_id, "n2")
 
     def test_replay_is_identical(self) -> None:
         report = replay(nodes(), (task("a", cpu=1), task("b", cpu=2), task("c", cpu=8, priority=3)))

@@ -66,8 +66,8 @@ higher `priority` first; at equal priority the task comes from the queue with th
 **weighted dominant share** — `max(used CPU / total CPU, used memory / total memory) / weight` over
 the running tasks — and remaining ties break on `arrival`, queue name and task id. Shares are
 recomputed after every release, placement and preemption. Node selection (first-fit / best-fit),
-affinity, anti-affinity, taints, preemption candidates and the conservative backfill boundary keep
-their existing semantics. The Python entry points (`simulate`, `replay`, `compare_policies`,
+affinity, anti-affinity, taints and the conservative backfill boundary keep their existing
+semantics, and preemption still searches victims only on nodes the static predicates accept. The Python entry points (`simulate`, `replay`, `compare_policies`,
 `Simulation`) take the same configuration as a mapping, `queue_weights={"team-a": 2}`.
 
 The `trace` decisions gain `queue`, `weight` and `weightedDominantShare` (the pre-decision share,
@@ -144,6 +144,18 @@ same configuration as a mapping, `queue_quotas={"team-a": Resources(8, 16)}`.
   ordered lowest-priority-first and then largest-request-first, and the search stops as soon as the
   incoming task fits. When even evicting everything would not free enough, the request is refused with
   that sentence instead of evicting and still failing.
+* **Preemption buys resources, never placement constraints.** An eviction changes only what is
+  running; it cannot add a label, remove one, or clear a taint. So the victim search applies the
+  *same static predicates* as ordinary placement — affinity, anti-affinity and taints — and searches
+  for lower-priority victims only on nodes those predicates accept, still in node-id order with the
+  existing priority / request / task-id victim ordering. A smaller-id node whose resources could be
+  freed but whose labels or taints reject the task is left untouched and the scheduler moves on to
+  the next compatible node; if no compatible node can hold the request even after evicting every
+  strictly lower-priority task, the task waits, is retried on the clock when resources are released,
+  and ends in `unplaced` (exit **3**) with the ordinary `no node fits` refusal if it never fits —
+  no task is ever evicted from an incompatible node, and `preemptions` counts only evictions that
+  really happen. A missing or mismatched affinity value, any `antiAffinity` label present, or any
+  taint absent from `tolerations` excludes the node identically for placement and preemption.
 * **Capacity is never over-committed.** The test suite re-walks a schedule tick by tick and asserts the
   sum of concurrent requests fits each node.
 * **Backfill is bounded.** When the waiting head cannot be placed, and only then, the scheduler
