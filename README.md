@@ -42,7 +42,9 @@ Unknown fields are rejected.
 | `policies …` | first-fit and best-fit side by side | 0 / **3** / 2 |
 | `replay …` | run twice and compare the traces | 0 / **3** (traces differ) / 2 |
 
-Common options: `--policy first-fit|best-fit`, `--preemption`, `--no-backfill`, `--cluster -` for stdin.
+Common options: `--policy first-fit|best-fit`, `--preemption`, `--no-backfill`, `--cluster -` for stdin,
+`--queue-weights PATH` and `--queue-quotas PATH` (each accepted by `simulate`, `trace`, `metrics`,
+`policies` and `replay`).
 
 ## Weighted fair share
 
@@ -80,6 +82,56 @@ An unreadable, empty, or duplicate-queue file, or a non-positive weight, is a `v
 broken JSON, a non-object row, a missing field, a wrong type or an unknown field is a
 `parse_error` carrying the raw line number. Both exit **2** with nothing written to stdout.
 
+## Queue concurrency quotas
+
+`simulate`, `trace`, `metrics`, `policies` and `replay` also accept `--queue-quotas PATH`, a
+UTF-8 JSONL file capping the CPU and memory a queue's *running* tasks may hold at once:
+
+```json
+{"queue": "team-a", "cpu": 8, "memory": 16}
+{"queue": "team-b", "cpu": 4, "memory": 8}
+```
+
+Each valid row contains exactly the non-empty string `queue` and the positive integers `cpu` and
+`memory`; queues must not repeat. A queue used by a task but absent from the file is unlimited.
+Supplying the file enables **quota mode**; without it every ordering, output field and exit code
+is unchanged. Quotas are independent of fair share — the two files may be given together.
+
+The quota check is the **first gate** on every placement attempt, ahead of node selection: the
+scheduler sums the queue's current running CPU and memory and refuses the task if adding its
+request would cross either limit. A blocked task probes no node, triggers no preemption, and
+cannot bypass the ceiling by evicting tasks of another queue — the gate is answered from the
+running usage before any victim is searched. The blocked task still takes its normal place in
+the waiting order; with backfill enabled the scheduler jumps past it for the **first** later
+candidate that meets the node constraints, the conservative time boundary **and its own queue
+quota**. Finishing and preempted tasks release their usage immediately, so a decision later in
+the same tick sees the release.
+
+The `trace` records each run of consecutive, unchanged quota refusals **once** — the scheduler
+retries a blocked task every tick, so the reason is de-duplicated exactly like a capacity
+refusal; the record is retained after the task is later placed. The reason begins with
+`queue quota exceeded` and names the queue, the task request, the current running use and the
+limit, e.g.
+
+```
+queue quota exceeded for queue team-a: task requests cpu=3,memory=1, running use cpu=6,memory=4, limit cpu=8,memory=16
+```
+
+When quotas are enabled, `simulate` and `metrics` gain a `quotas` object keyed by queue name
+(sorted). Each entry reports the configured `cpu` and `memory`, the `peakCpu` and `peakMemory`
+actually reached over the half-open running intervals (never above the limit), and `blocked`, the
+number of **distinct** tasks ever refused because of that queue's quota. `policies` attaches the
+same summary to every policy result; `replay` still compares the full `(task, node, start, end)`
+trace. If quotas leave a task unplaced, it appears in `unplaced` and the refusal trace as usual
+and the process exits **3**. Affinity, anti-affinity, taints, first-fit / best-fit, fair share,
+preemption and the backfill boundary are otherwise unchanged.
+
+An unreadable or empty file, a duplicate queue, or a non-positive `cpu` / `memory` is a
+`validation_error`; broken JSON, a non-object row, a missing field, a wrong type or an unknown
+field is a `parse_error` carrying the raw line number. Both exit **2** with nothing written to
+stdout. The Python entry points (`simulate`, `replay`, `compare_policies`, `Simulation`) take the
+same configuration as a mapping, `queue_quotas={"team-a": Resources(8, 16)}`.
+
 ## What the scheduler promises
 
 * **Every rejection says why.** Predicates are checked in a fixed order (capacity, affinity,
@@ -106,6 +158,12 @@ broken JSON, a non-object row, a missing field, a wrong type or an unknown field
   waiters on the fresh occupancy and weighted shares and may place or backfill again at the same
   tick. Affinity, anti-affinity, taints, first-fit / best-fit node choice and the preemption rules
   are unchanged inside a backfill.
+* **A queue quota is a hard ceiling, checked first.** Before any node is probed the running CPU and
+  memory of the task's queue plus its request must stay at or under the queue's limits; a blocked
+  task neither touches a node nor triggers a preemption of any queue, so a quota can never be
+  bypassed by an eviction. A backfill probe that fails the quota is as silent and side-effect free
+  as one that fails a node predicate, and running usage is released the instant a task finishes or
+  is preempted.
 * **Reproducibility is checked, not asserted.** `replay` runs the same input through the simulator twice
   and compares the full `(task, node, start, end)` trace, reporting `identical` and any difference, and
   exiting **3** when the two runs disagree.

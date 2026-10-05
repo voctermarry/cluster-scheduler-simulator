@@ -15,6 +15,15 @@ recomputed after every release, placement and preemption. Shares are kept as exa
 ratios (``Fraction``), so ordering never loses precision on large integer capacities; the value
 is rounded to six decimals only when it leaves the simulator in a trace or metric document.
 Without that mapping, nothing changes.
+
+With ``queue_quotas`` supplied each queue additionally gets a hard concurrency ceiling on the CPU
+and memory of its running tasks. The quota check is the *first* gate on every placement attempt,
+ahead of node selection and preemption: a task whose running queue usage plus its own request
+would pass either limit is refused, probes no node, and triggers no preemption of any queue -- a
+ceiling can never be bypassed by an eviction, because preemption is only searched once the gate
+admits the request. Finishing and evicted tasks release their usage immediately, so a later
+decision at the same tick sees it. Backfill may jump a quota-blocked head for the first later
+candidate whose own queue quota still admits it. Without that mapping, nothing changes.
 """
 
 from __future__ import annotations
@@ -59,6 +68,7 @@ class Simulation:
     allow_preemption: bool = False
     backfill: bool = True
     queue_weights: dict[str, int] | None = None
+    queue_quotas: dict[str, Resources] | None = None
     _cluster: Cluster = field(init=False)
     _placements: list[Placement] = field(default_factory=list, init=False)
     _released: set[int] = field(default_factory=set, init=False)
@@ -66,6 +76,9 @@ class Simulation:
     _preemptions: int = field(default=0, init=False)
     _waits: list[int] = field(default_factory=list, init=False)
     _last_refusal: dict[str, str] = field(default_factory=dict, init=False)
+    _quota_usage: dict[str, Resources] = field(default_factory=dict, init=False)
+    _quota_blocked: set[str] = field(default_factory=set, init=False)
+    _quota_peaks: dict[str, Resources] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         if self.policy not in POLICIES:
@@ -81,6 +94,22 @@ class Simulation:
                     raise ValidationError("queue weights must use non-empty queue names", value=name)
                 if isinstance(weight, bool) or not isinstance(weight, int) or weight <= 0:
                     raise ValidationError("queue weights must be positive integers", queue=name, value=weight)
+        if self.queue_quotas is not None:
+            if not self.queue_quotas:
+                raise ValidationError("queue quotas must declare at least one queue")
+            for name, quota in self.queue_quotas.items():
+                if not isinstance(name, str) or not name:
+                    raise ValidationError("queue quotas must use non-empty queue names", value=name)
+                if (
+                    not isinstance(quota, Resources)
+                    or isinstance(quota.cpu, bool)
+                    or isinstance(quota.memory, bool)
+                    or quota.cpu <= 0
+                    or quota.memory <= 0
+                ):
+                    raise ValidationError(
+                        "queue quotas must be positive cpu and memory limits", queue=name, value=quota
+                    )
         self._cluster = Cluster(self.nodes)
 
     # -- bookkeeping -----------------------------------------------------------------------------
@@ -96,6 +125,55 @@ class Simulation:
         # A queue used by a task but absent from the config carries an implicit weight of one.
         assert self.queue_weights is not None
         return self.queue_weights.get(queue, 1)
+
+    # -- queue quotas -----------------------------------------------------------------------------
+    @property
+    def quotas_enabled(self) -> bool:
+        return self.queue_quotas is not None
+
+    def _quota(self, queue: str) -> Resources | None:
+        if self.queue_quotas is None:
+            return None
+        return self.queue_quotas.get(queue)
+
+    def _quota_used(self, queue: str) -> Resources:
+        return self._quota_usage.get(queue, Resources(0, 0))
+
+    def _quota_refusal(self, task: Task) -> str | None:
+        """The hard-ceiling refusal for ``task`` against its queue's *current* running usage.
+
+        Runs before any node is probed, so a blocked task neither touches node predicates nor
+        triggers preemption -- a queue quota can never be bypassed by evicting tasks of another
+        queue. A queue without a configured quota is unrestricted.
+        """
+        quota = self._quota(task.queue)
+        if quota is None:
+            return None
+        used = self._quota_used(task.queue)
+        next_cpu = used.cpu + task.request.cpu
+        next_memory = used.memory + task.request.memory
+        if next_cpu <= quota.cpu and next_memory <= quota.memory:
+            return None
+        return (
+            f"queue quota exceeded for queue {task.queue}: "
+            f"task requests cpu={task.request.cpu},memory={task.request.memory}, "
+            f"running use cpu={used.cpu},memory={used.memory}, "
+            f"limit cpu={quota.cpu},memory={quota.memory}"
+        )
+
+    def _charge_quota(self, task: Task) -> None:
+        quota = self._quota(task.queue)
+        if quota is None:
+            return
+        usage = self._quota_used(task.queue).plus(task.request)
+        self._quota_usage[task.queue] = usage
+        peak = self._quota_peaks.get(task.queue, Resources(0, 0))
+        self._quota_peaks[task.queue] = Resources(max(peak.cpu, usage.cpu), max(peak.memory, usage.memory))
+
+    def _release_quota(self, task: Task) -> None:
+        if self._quota(task.queue) is None:
+            return
+        self._quota_usage[task.queue] = self._quota_used(task.queue).minus(task.request)
 
     def _shares(self, clock: int) -> dict[str, Fraction]:
         """Weighted dominant share of every queue from the tasks running at ``clock``.
@@ -153,11 +231,14 @@ class Simulation:
         for index, item in enumerate(self._placements):
             if index in self._released or item.end > clock:
                 continue
-            self._cluster.release(item.node_id, self.task_index[item.task_id].request)
+            task = self.task_index[item.task_id]
+            self._cluster.release(item.node_id, task.request)
+            self._release_quota(task)
             self._released.add(index)
 
     def _place(self, task: Task, node_id: str, clock: int, preempted: tuple[str, ...]) -> None:
         self._cluster.occupy(node_id, task.request)
+        self._charge_quota(task)
         self._placements.append(Placement(task.id, node_id, clock, clock + task.duration, preempted))
         self._waits.append(clock - task.arrival)
 
@@ -291,6 +372,13 @@ class Simulation:
 
     def _try_place(self, task: Task, clock: int) -> bool:
         context = self._fair_context(task, clock)
+        # The hard quota is the first gate, ahead of node selection and preemption: a blocked task
+        # probes no node and can never buy room by evicting another queue's tasks.
+        quota_reason = self._quota_refusal(task)
+        if quota_reason is not None:
+            self._quota_blocked.add(task.id)
+            self._record_refusal(task, quota_reason, clock, context)
+            return False
         decision = select_node(self._cluster, task, self.policy)
         if decision.node_id is not None:
             self._place(task, decision.node_id, clock, ())
@@ -316,7 +404,9 @@ class Simulation:
                 continue
             for item in chosen:
                 index = self._placements.index(item)
-                self._cluster.release(item.node_id, self.task_index[item.task_id].request)
+                victim = self.task_index[item.task_id]
+                self._cluster.release(item.node_id, victim.request)
+                self._release_quota(victim)
                 self._placements[index] = Placement(item.task_id, item.node_id, item.start, clock, item.preempted)
                 self._released.add(index)
                 self._preemptions += 1
@@ -337,8 +427,12 @@ class Simulation:
         attempt -- capacity, affinity, anti-affinity, taints and the first-fit / best-fit node order
         are unchanged. A candidate that does not fit right now produces neither a placement nor a
         refusal and never triggers preemption: probing is free and invisible, so a failed candidate
-        can still be placed later as an ordinary head.
+        can still be placed later as an ordinary head. The hard quota is part of that probe: a
+        candidate whose own queue is at its ceiling is skipped as invisibly as one that misses a
+        node, letting a later, admitted candidate take the jump.
         """
+        if self._quota_refusal(task) is not None:
+            return False
         decision = select_node(self._cluster, task, self.policy)
         if decision.node_id is None:
             return False
@@ -373,7 +467,31 @@ class Simulation:
         }
         if self.fair:
             metrics["queues"] = self._queue_metrics(makespan, set(unplaced))
+        if self.quotas_enabled:
+            metrics["quotas"] = self._quota_metrics()
         return metrics
+
+    def _quota_metrics(self) -> dict[str, object]:
+        """One summary per configured queue quota, keyed by sorted queue name.
+
+        ``peakCpu`` / ``peakMemory`` are the largest concurrent usage the queue ever held over the
+        half-open running intervals; a charge is only allowed after the gate proves it stays at or
+        under the limit, so a peak can never exceed ``cpu`` / ``memory``. ``blocked`` counts the
+        distinct tasks that were at least once refused as a placement because of their queue quota.
+        """
+        assert self.queue_quotas is not None
+        report: dict[str, object] = {}
+        for name in sorted(self.queue_quotas):
+            quota = self.queue_quotas[name]
+            peak = self._quota_peaks.get(name, Resources(0, 0))
+            report[name] = {
+                "cpu": quota.cpu,
+                "memory": quota.memory,
+                "peakCpu": peak.cpu,
+                "peakMemory": peak.memory,
+                "blocked": sum(1 for task in self.tasks if task.queue == name and task.id in self._quota_blocked),
+            }
+        return report
 
     def _queue_metrics(self, makespan: int, unplaced: set[str]) -> dict[str, object]:
         """Per-queue accounting over the actual run intervals.
@@ -452,5 +570,7 @@ def compare_policies(
         }
         if "queues" in result.metrics:
             entry["queues"] = result.metrics["queues"]
+        if "quotas" in result.metrics:
+            entry["quotas"] = result.metrics["quotas"]
         results.append(entry)
     return {"policies": results}

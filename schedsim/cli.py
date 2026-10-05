@@ -174,6 +174,53 @@ def load_queue_weights(path: str) -> dict[str, int]:
     return weights
 
 
+def load_queue_quotas(path: str) -> dict[str, Resources]:
+    """Parse the optional JSONL ``{"queue": ..., "cpu": ..., "memory": ...}`` file.
+
+    Shape problems -- broken JSON, a non-object row, missing fields, wrong types, unknown fields --
+    are parse errors naming the raw line. Semantic problems -- a non-positive cpu or memory, or a
+    queue declared twice -- are validation errors. A file with no valid rows is rejected rather
+    than silently treated as "no quotas" (which would run the baseline instead of the requested
+    mode). Queues used by tasks but absent from the file are simply unlimited.
+    """
+    quotas: dict[str, Resources] = {}
+    for number, document in _rows(path, "queue quotas"):
+        unknown = sorted(set(document) - {"queue", "cpu", "memory"})
+        if unknown:
+            raise ParseError(f"queue quotas line {number}: unknown field(s): {', '.join(unknown)}", line=number)
+        if "queue" not in document:
+            raise ParseError(f"queue quotas line {number}: missing queue", line=number)
+        if "cpu" not in document:
+            raise ParseError(f"queue quotas line {number}: missing cpu", line=number)
+        if "memory" not in document:
+            raise ParseError(f"queue quotas line {number}: missing memory", line=number)
+        queue = document["queue"]
+        cpu = document["cpu"]
+        memory = document["memory"]
+        if not isinstance(queue, str) or not queue:
+            raise ParseError(f"queue quotas line {number}: queue must be a non-empty string", line=number)
+        if isinstance(cpu, bool) or not isinstance(cpu, int):
+            raise ParseError(f"queue quotas line {number}: cpu must be an integer", line=number)
+        if isinstance(memory, bool) or not isinstance(memory, int):
+            raise ParseError(f"queue quotas line {number}: memory must be an integer", line=number)
+        if cpu <= 0 or memory <= 0:
+            raise ValidationError(
+                f"queue quotas line {number}: cpu and memory must be positive",
+                line=number,
+                queue=queue,
+                cpu=cpu,
+                memory=memory,
+            )
+        if queue in quotas:
+            raise ValidationError(
+                f"queue quotas line {number}: duplicate queue {queue!r}", line=number, queue=queue
+            )
+        quotas[queue] = Resources(cpu, memory)
+    if not quotas:
+        raise ValidationError("the queue quotas file is empty", value=path)
+    return quotas
+
+
 def _options(args: argparse.Namespace) -> dict[str, object]:
     options: dict[str, object] = {
         "policy": args.policy,
@@ -183,6 +230,9 @@ def _options(args: argparse.Namespace) -> dict[str, object]:
     path = getattr(args, "queue_weights", None)
     if path:
         options["queue_weights"] = load_queue_weights(path)
+    quotas_path = getattr(args, "queue_quotas", None)
+    if quotas_path:
+        options["queue_quotas"] = load_queue_quotas(quotas_path)
     return options
 
 
@@ -304,6 +354,11 @@ def build_parser() -> argparse.ArgumentParser:
             "--queue-weights",
             metavar="PATH",
             help="JSONL {queue, weight} rows; enables weighted fair-share scheduling",
+        )
+        sub.add_argument(
+            "--queue-quotas",
+            metavar="PATH",
+            help="JSONL {queue, cpu, memory} rows; enables hard per-queue concurrency quotas",
         )
         return sub
 

@@ -46,6 +46,7 @@ class Scenario(NamedTuple):
     nodes: tuple[Node, ...]
     tasks: tuple[Task, ...]
     weights: dict[str, int]
+    quotas: dict[str, tuple[int, int]]
 
 
 def scenario_staggered() -> Scenario:
@@ -66,6 +67,7 @@ def scenario_staggered() -> Scenario:
             task("f", cpu=9, memory=1, priority=1, queue="q3", arrival=0, duration=1),
         ),
         {"q1": 2, "q2": 1, "q3": 3},
+        {"q1": (4, 8), "q2": (4, 8), "q3": (4, 8)},
     )
 
 
@@ -87,6 +89,7 @@ def scenario_memory_bound() -> Scenario:
             task("m6", cpu=1, memory=9, priority=1, queue="q3", arrival=0, duration=1),
         ),
         {"q1": 1, "q2": 3, "q3": 2},
+        {"q1": (8, 4), "q2": (8, 8), "q3": (8, 8)},
     )
 
 
@@ -104,6 +107,7 @@ def scenario_preemption() -> Scenario:
             task("mid", cpu=1, memory=1, priority=5, queue="hi", arrival=1, duration=3),
         ),
         {"lo": 1, "hi": 2},
+        {"lo": (4, 4), "hi": (4, 4)},
     )
 
 
@@ -125,6 +129,7 @@ def scenario_backfill() -> Scenario:
             task("zshort", cpu=1, memory=1, priority=1, queue="q3", arrival=1, duration=2),
         ),
         {"q1": 1, "q2": 2, "q3": 1},
+        {"q1": (2, 2), "q2": (4, 4), "q3": (1, 1)},
     )
 
 
@@ -142,6 +147,7 @@ def scenario_fair() -> Scenario:
             task("C2", cpu=3, memory=1, priority=0, queue="C", arrival=2, duration=2),
         ),
         {"A": 3, "B": 1, "C": 2},
+        {"A": (3, 4), "B": (2, 4), "C": (3, 4)},
     )
 
 
@@ -154,20 +160,25 @@ SCENARIOS = (
 )
 
 
-def option_matrix(weights: dict[str, int]):
-    """Every combination of policy, preemption, backfill and queue weights."""
+def option_matrix(weights: dict[str, int], quota_rows=None):
+    """Every combination of policy, preemption, backfill, queue weights and queue quotas."""
     for policy in POLICIES:
         for allow_preemption in (False, True):
             for backfill in (False, True):
                 for fair in (False, True):
-                    options: dict[str, object] = {
-                        "policy": policy,
-                        "allow_preemption": allow_preemption,
-                        "backfill": backfill,
-                    }
-                    if fair:
-                        options["queue_weights"] = dict(weights)
-                    yield options
+                    for with_quotas in (False, True):
+                        options: dict[str, object] = {
+                            "policy": policy,
+                            "allow_preemption": allow_preemption,
+                            "backfill": backfill,
+                        }
+                        if fair:
+                            options["queue_weights"] = dict(weights)
+                        if with_quotas and quota_rows:
+                            options["queue_quotas"] = {
+                                name: Resources(cpu, memory) for name, (cpu, memory) in quota_rows.items()
+                            }
+                        yield options
 
 
 # -- independent oracle --------------------------------------------------------------------------
@@ -257,6 +268,42 @@ def oracle_order(pending, shares, fair: bool):
     )
 
 
+def oracle_queue_use(tasks_by_id, intervals, clock) -> dict[str, list[int]]:
+    """The running [cpu, memory] each queue holds at ``clock`` under half-open intervals."""
+    used: dict[str, list[int]] = {}
+    for item in intervals:
+        if item.start <= clock < item.end:
+            owner = tasks_by_id[item.task_id]
+            cpu, memory = used.get(owner.queue, [0, 0])
+            used[owner.queue] = [cpu + owner.request.cpu, memory + owner.request.memory]
+    return used
+
+
+def oracle_quota_blocks(task_: Task, use: dict[str, list[int]], quotas) -> tuple[list[int], list[int]] | None:
+    """Return ``(running, limit)`` if the hard quota refuses ``task_`` at the current use, else None.
+
+    This is the *first* gate: it is answered purely from running queue usage, before any node or
+    preemption question, so a queue absent from ``quotas`` and a request that still fits are both
+    admitted (None).
+    """
+    limit = quotas.get(task_.queue) if quotas else None
+    if limit is None:
+        return None
+    cpu, memory = use.get(task_.queue, [0, 0])
+    if cpu + task_.request.cpu <= limit[0] and memory + task_.request.memory <= limit[1]:
+        return None
+    return [cpu, memory], list(limit)
+
+
+def oracle_quota_reason(task_: Task, running: list[int], limit: list[int]) -> str:
+    return (
+        f"queue quota exceeded for queue {task_.queue}: "
+        f"task requests cpu={task_.request.cpu},memory={task_.request.memory}, "
+        f"running use cpu={running[0]},memory={running[1]}, "
+        f"limit cpu={limit[0]},memory={limit[1]}"
+    )
+
+
 def oracle_victims(task_: Task, node_id: str, intervals, tasks_by_id, free, clock: int):
     """The smallest set of lower-priority running tasks whose eviction fits ``task_``."""
     candidates = [
@@ -293,6 +340,7 @@ def check_run(tc: unittest.TestCase, scenario: Scenario, options: dict, result) 
     fair = "queue_weights" in options
     weights: dict[str, int] = options.get("queue_weights", {})
     allow_preemption = options["allow_preemption"]
+    quota_rows: dict[str, tuple[int, int]] = scenario.quotas if "queue_quotas" in options else {}
     tasks_by_id = {t.id: t for t in tasks}
     requests = {t.id: t.request for t in tasks}
     node_ids = {node.id for node in nodes}
@@ -336,6 +384,13 @@ def check_run(tc: unittest.TestCase, scenario: Scenario, options: dict, result) 
         for node in nodes:
             tc.assertGreaterEqual(free[node.id][0], 0, f"cpu overcommitted on {node.id} at {clock}")
             tc.assertGreaterEqual(free[node.id][1], 0, f"memory overcommitted on {node.id} at {clock}")
+        # a hard quota may never be exceeded by the running usage at any half-open event instant
+        if quota_rows:
+            queue_use = oracle_queue_use(tasks_by_id, result.placements, clock)
+            for name, (cpu_limit, memory_limit) in quota_rows.items():
+                used_cpu, used_memory = queue_use.get(name, [0, 0])
+                tc.assertLessEqual(used_cpu, cpu_limit, f"queue {name} over cpu quota at {clock}")
+                tc.assertLessEqual(used_memory, memory_limit, f"queue {name} over memory quota at {clock}")
     tc.assertEqual(
         result.placements,
         sorted(result.placements, key=lambda p: (p.start, p.task_id)),
@@ -345,6 +400,7 @@ def check_run(tc: unittest.TestCase, scenario: Scenario, options: dict, result) 
     # -- decision walk: replay the trace against independently recomputed state -------------------
     decided: list[Interval] = []
     final_entries = []
+    quota_blocked_oracle: set[str] = set()
     last_at = 0
     for entry in result.decisions:
         if "at" not in entry:
@@ -355,6 +411,7 @@ def check_run(tc: unittest.TestCase, scenario: Scenario, options: dict, result) 
         last_at = clock
         current = tasks_by_id[entry["task"]]
         free = oracle_free(nodes, requests, decided, clock)
+        queue_use = oracle_queue_use(tasks_by_id, decided, clock)
         placed_so_far = {item.task_id for item in decided}
         pending = [t for t in tasks if t.arrival <= clock and t.id not in placed_so_far]
         shares = (
@@ -374,26 +431,43 @@ def check_run(tc: unittest.TestCase, scenario: Scenario, options: dict, result) 
                 tc.assertNotIn(key, entry, "fair-share field present without queue weights")
 
         if "node" not in entry:
-            # a refusal: the reason must be the predicate-ordered failure, rebuilt independently
-            _, expected_reason = oracle_select(nodes, free, current, policy)
-            tc.assertEqual(entry["reason"], expected_reason)
+            # a refusal: the hard quota gate is checked first, then the predicate-ordered node
+            # failure -- both rebuilt independently from the running usage.
+            quota_block = oracle_quota_blocks(current, queue_use, quota_rows)
+            if quota_block is not None:
+                running, limit = quota_block
+                tc.assertEqual(entry["reason"], oracle_quota_reason(current, running, limit))
+                quota_blocked_oracle.add(current.id)
+            else:
+                _, expected_reason = oracle_select(nodes, free, current, policy)
+                tc.assertEqual(entry["reason"], expected_reason)
             continue
+
+        # any placement -- normal, preempting or backfilled -- passed the hard quota gate against
+        # the pre-decision running usage (a would-be victim is still running at this instant)
+        tc.assertIsNone(
+            oracle_quota_blocks(current, queue_use, quota_rows),
+            f"{current.id} was placed over its queue quota",
+        )
 
         reason = entry["reason"]
         if reason == "backfill":
             head = order[0]
             tc.assertNotEqual(head.id, current.id, "a backfill candidate may not be the head")
-            # the jumped head genuinely could not be placed at this tick
-            for node in nodes:
-                tc.assertIsNotNone(
-                    oracle_first_failure(head, node, *free[node.id]),
-                    f"jumped head {head.id} actually fits {node.id}",
-                )
-                if allow_preemption and head.priority > 0:
-                    tc.assertIsNone(
-                        oracle_victims(head, node.id, decided, tasks_by_id, free, clock),
-                        f"jumped head {head.id} could have been placed by preemption",
+            # the jumped head genuinely could not be placed at this tick: either its own queue quota
+            # refuses it (the first gate), or every node rejects it and no preemption can help.
+            head_quota_blocked = oracle_quota_blocks(head, queue_use, quota_rows) is not None
+            if not head_quota_blocked:
+                for node in nodes:
+                    tc.assertIsNotNone(
+                        oracle_first_failure(head, node, *free[node.id]),
+                        f"jumped head {head.id} actually fits {node.id}",
                     )
+                    if allow_preemption and head.priority > 0:
+                        tc.assertIsNone(
+                            oracle_victims(head, node.id, decided, tasks_by_id, free, clock),
+                            f"jumped head {head.id} could have been placed by preemption",
+                        )
             running_ends = [item.end for item in decided if item.start <= clock < item.end]
             tc.assertTrue(running_ends, "backfill happened with nothing running")
             horizon = min(running_ends)
@@ -402,16 +476,18 @@ def check_run(tc: unittest.TestCase, scenario: Scenario, options: dict, result) 
                 horizon,
                 "backfilled task ends past the earliest running completion",
             )
-            # the candidate must be the FIRST qualifier behind the head in the declared order
+            # the candidate must be the FIRST qualifier behind the head in the declared order; a
+            # qualifier passes BOTH the hard quota gate and a node and meets the time boundary
             for earlier in order[1:]:
                 if earlier.id == current.id:
                     break
+                admitted = oracle_quota_blocks(earlier, queue_use, quota_rows) is None
                 fits_some = any(
                     oracle_first_failure(earlier, node, *free[node.id]) is None
                     for node in oracle_node_order(nodes, free, policy)
                 )
                 tc.assertFalse(
-                    fits_some and clock + earlier.duration <= horizon,
+                    admitted and fits_some and clock + earlier.duration <= horizon,
                     f"{earlier.id} qualified for backfill before {current.id}",
                 )
             expected_node, _ = oracle_select(nodes, free, current, policy)
@@ -512,12 +588,39 @@ def check_run(tc: unittest.TestCase, scenario: Scenario, options: dict, result) 
                 "dominantShare": round(max(cpu_share, memory_share) / weights.get(name, 1), 6),
             }
         expected_metrics["queues"] = queues
+    if quota_rows:
+        # peaks: the largest running usage at every distinct half-open event instant, derived from
+        # the placements alone; blocked: distinct tasks the trace records as quota-refused as head
+        peak_cpu: dict[str, int] = {}
+        peak_memory: dict[str, int] = {}
+        for clock in {p.start for p in result.placements} | {p.end for p in result.placements}:
+            use = oracle_queue_use(tasks_by_id, result.placements, clock)
+            for name in quota_rows:
+                cpu, memory = use.get(name, [0, 0])
+                peak_cpu[name] = max(peak_cpu.get(name, 0), cpu)
+                peak_memory[name] = max(peak_memory.get(name, 0), memory)
+        quotas: dict[str, object] = {}
+        for name in sorted(quota_rows):
+            limit_cpu, limit_memory = quota_rows[name]
+            quotas[name] = {
+                "cpu": limit_cpu,
+                "memory": limit_memory,
+                "peakCpu": peak_cpu.get(name, 0),
+                "peakMemory": peak_memory.get(name, 0),
+                "blocked": sum(
+                    1
+                    for t in tasks
+                    if t.queue == name and t.id in quota_blocked_oracle
+                ),
+            }
+        expected_metrics["quotas"] = quotas
     tc.assertEqual(result.metrics, expected_metrics)
 
 
 def check_cross_entry(tc: unittest.TestCase, scenario: Scenario, options: dict, result) -> None:
     """The same input through the other public entries must agree with ``simulate``."""
     fair = "queue_weights" in options
+    quota_enabled = "queue_quotas" in options
     policy_options = {key: value for key, value in options.items() if key != "policy"}
     report = compare_policies(scenario.nodes, scenario.tasks, **policy_options)
     tc.assertEqual([entry["policy"] for entry in report["policies"]], list(POLICIES))
@@ -532,6 +635,10 @@ def check_cross_entry(tc: unittest.TestCase, scenario: Scenario, options: dict, 
             tc.assertEqual(entry["queues"], solo.metrics["queues"])
         else:
             tc.assertNotIn("queues", entry)
+        if quota_enabled:
+            tc.assertEqual(entry["quotas"], solo.metrics["quotas"])
+        else:
+            tc.assertNotIn("quotas", entry)
     check = replay(scenario.nodes, scenario.tasks, **options)
     tc.assertTrue(check["identical"])
     tc.assertEqual(check["differences"], [])
@@ -544,12 +651,13 @@ def check_cross_entry(tc: unittest.TestCase, scenario: Scenario, options: dict, 
 class MatrixTests(unittest.TestCase):
     def test_every_scenario_every_option_combination(self) -> None:
         for scenario in SCENARIOS:
-            for options in option_matrix(scenario.weights):
+            for options in option_matrix(scenario.weights, scenario.quotas):
                 label = (
                     f"{scenario.name}/{options['policy']}"
                     f"/preemption={options['allow_preemption']}"
                     f"/backfill={options['backfill']}"
                     f"/fair={'queue_weights' in options}"
+                    f"/quotas={'queue_quotas' in options}"
                 )
                 with self.subTest(label):
                     result = simulate(scenario.nodes, scenario.tasks, **options)
