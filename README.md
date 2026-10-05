@@ -42,7 +42,9 @@ Unknown fields are rejected.
 | `policies …` | first-fit and best-fit side by side | 0 / **3** / 2 |
 | `replay …` | run twice and compare the traces | 0 / **3** (traces differ) / 2 |
 
-Common options: `--policy first-fit|best-fit`, `--preemption`, `--no-backfill`, `--cluster -` for stdin.
+Common options: `--policy first-fit|best-fit`, `--preemption`, `--no-backfill`,
+`--queue-weights PATH` (fair share), `--queue-quotas PATH` (hard per-queue limits),
+`--cluster -` for stdin.
 
 ## Weighted fair share
 
@@ -79,6 +81,58 @@ capacity or makespan is zero. `policies` attaches the same per-queue metrics to 
 An unreadable, empty, or duplicate-queue file, or a non-positive weight, is a `validation_error`;
 broken JSON, a non-object row, a missing field, a wrong type or an unknown field is a
 `parse_error` carrying the raw line number. Both exit **2** with nothing written to stdout.
+
+## Queue concurrency quotas
+
+`simulate`, `trace`, `metrics`, `policies` and `replay` also accept `--queue-quotas PATH`, a
+UTF-8 JSONL file with one object per line:
+
+```json
+{"queue": "team-a", "cpu": 16, "memory": 32}
+{"queue": "team-b", "cpu": 8, "memory": 16}
+```
+
+Each valid row contains exactly the non-empty string `queue` and the positive integers `cpu` and
+`memory`; queues must not repeat. The values are a **hard ceiling** on the CPU and memory held at
+once by that queue's running tasks. A queue not named in the file is unlimited, and supplying no
+file at all leaves every ordering, output field and exit code unchanged. The Python entry points
+(`simulate`, `replay`, `compare_policies`, `Simulation`) take the same configuration as a mapping
+of queue name to `Resources`, `queue_quotas={"team-a": Resources(16, 32)}`.
+
+Before **every** placement the scheduler sums the CPU and memory of the queue's currently running
+tasks and refuses the task when adding its request would exceed either limit. The check runs
+**before node selection**: a blocked task probes no node, triggers no preemption, and cannot evade
+the ceiling by evicting tasks of other queues (the limit is on its own queue). It keeps its place
+in the existing waiting order — priority, fair share and arrival ordering are unchanged. With
+backfill enabled, the scheduler may still start the first later candidate that satisfies the node
+predicates, the conservative time boundary **and its own quota**; a candidate over its own quota
+is probed without side effects, exactly like one that fails a node predicate. A finished or
+preempted task releases its quota occupancy immediately, so a decision at the same tick already
+sees the release.
+
+A quota refusal appears in the `trace` once per contiguous unchanged spell (the same deduping as
+every refusal), even if the task is placed later. Its reason starts with
+`queue quota exceeded` and names the queue, the task request, the current running occupancy and
+the limit, e.g.
+`queue quota exceeded for queue team-a: request cpu=2,memory=4 running cpu=14,memory=20 limit cpu=16,memory=32`.
+
+When the file is supplied, `simulate` and `metrics` gain a `quotas` object keyed by queue name
+(sorted). Each queue reports:
+
+| Field | Meaning |
+|---|---|
+| `cpu`, `memory` | the configured limit |
+| `peakCpu`, `peakMemory` | most CPU / memory held concurrently over the half-open run intervals; never above the limit |
+| `blocked` | number of distinct tasks ever refused by the queue's quota gate |
+
+`policies` attaches the same `quotas` summary to every policy result; `replay` keeps comparing the
+full `(task, node, start, end)` placement trajectory. If quotas leave tasks unplaced, they appear
+in `unplaced` with their refusal in the trace and the command exits **3** as usual.
+
+An unreadable, empty, or duplicate-queue file, or a non-positive `cpu`/`memory`, is a
+`validation_error`; broken JSON, a non-object row, a missing field, a wrong type or an unknown
+field is a `parse_error` carrying the raw line number. Both exit **2** with nothing written to
+stdout.
 
 ## What the scheduler promises
 
