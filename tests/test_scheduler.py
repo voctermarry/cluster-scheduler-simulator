@@ -564,5 +564,165 @@ class FairShareTests(unittest.TestCase):
                 simulate(cluster_nodes, tasks, queue_weights=bad)
 
 
+class ExactShareTests(unittest.TestCase):
+    """Weighted shares must follow the exact rational definition, never a binary float rounding.
+
+    The scenarios use ~1e20 integer capacities: at that magnitude two fractions differing by a
+    single unit of numerator map to the SAME IEEE double, so float ordering silently falls through
+    to the queue/id tie-break. Every scenario below was observed to produce the wrong order on the
+    float implementation and the right order on exact arithmetic. The displayed
+    ``weightedDominantShare`` / ``dominantShare`` stay rounded to six decimals -- both exact values
+    can print as one number without that changing who is picked first.
+    """
+
+    CAPACITY = 10**20
+    HALF = 10**20 // 2
+
+    def node(self, cpu: int | None = None, memory: int | None = None) -> tuple[Node, ...]:
+        return (Node("n1", Resources(self.CAPACITY if cpu is None else cpu, self.CAPACITY if memory is None else memory)),)
+
+    def test_sub_ulp_difference_orders_consecutive_placements_at_one_tick(self) -> None:
+        # Anchors leave queue Z one unit below queue A; each unit placed flips which queue is ahead,
+        # so four same-tick placements must alternate z, a, z, a. Float shares are both 0.5 and the
+        # old code served a1, a2, z1, z2 by queue name instead.
+        tasks = (
+            task("aRun", cpu=self.HALF - 2, memory=1, queue="A", duration=10),
+            task("zRun", cpu=self.HALF - 3, memory=1, queue="Z", duration=10),
+            task("z1", cpu=1, queue="Z", arrival=1),
+            task("a1", cpu=1, queue="A", arrival=1),
+            task("z2", cpu=1, queue="Z", arrival=1),
+            task("a2", cpu=1, queue="A", arrival=1),
+        )
+        result = simulate(self.node(), tasks, queue_weights={"A": 1, "Z": 1})
+        at_one = [entry["task"] for entry in result.decisions if "node" in entry and entry["at"] == 1]
+        self.assertEqual(at_one, ["z1", "a1", "z2", "a2"])
+        # All four exact shares round to the same six-decimal number; the display never drove order.
+        self.assertEqual({entry["weightedDominantShare"] for entry in result.decisions if entry.get("at") == 1}, {0.5})
+
+    def test_release_recomputes_exact_shares_before_same_tick_decisions(self) -> None:
+        # At tick 2 zBlink's single unit is released: Z then holds HALF-1 versus A holding HALF, a
+        # sub-ulp gap. Exact ordering serves zNext first (which refills the cluster); aNext waits one
+        # more tick. Float ordering saw both queues at 0.5 and picked aNext by queue name.
+        tasks = (
+            task("aRun", cpu=self.HALF, memory=1, queue="A", duration=10),
+            task("zRun", cpu=self.HALF - 1, memory=1, queue="Z", duration=10),
+            task("zBlink", cpu=1, queue="Z", duration=2),
+            task("aNext", cpu=1, queue="A", arrival=2),
+            task("zNext", cpu=1, queue="Z", arrival=2),
+        )
+        result = simulate(self.node(), tasks, queue_weights={"A": 1, "Z": 1})
+        placed = {entry["task"]: entry["at"] for entry in result.decisions if "node" in entry}
+        self.assertEqual((placed["zNext"], placed["aNext"]), (2, 3))
+        starts = {item.task_id: item.start for item in result.placements}
+        self.assertEqual((starts["zNext"], starts["aNext"]), (2, 3))
+        self.assertEqual(result.unplaced, [])
+
+    def test_successful_preemption_recomputes_exact_shares(self) -> None:
+        # hi evicts zTiny at tick 1, taking its two units from queue Z. Z then holds HALF-1 and A
+        # HALF, so the equal-priority survivors pick zNext before aNext; float ties served aNext.
+        tasks = (
+            task("aAnchor", cpu=self.HALF, memory=1, queue="A", priority=5, duration=10),
+            task("zAnchor", cpu=self.HALF - 2, memory=1, queue="Z", priority=5, duration=10),
+            task("zTiny", cpu=2, queue="Z", priority=1, duration=10),
+            task("hi", cpu=1, queue="H", priority=9, arrival=1),
+            task("aNext", cpu=1, queue="A", arrival=1),
+            task("zNext", cpu=1, queue="Z", arrival=1),
+        )
+        result = simulate(self.node(), tasks, queue_weights={"A": 1, "Z": 1, "H": 1}, allow_preemption=True)
+        self.assertEqual(result.metrics["preemptions"], 1)
+        hi = next(item for item in result.placements if item.task_id == "hi")
+        self.assertEqual(hi.preempted, ("zTiny",))
+        at_one = [entry["task"] for entry in result.decisions if "node" in entry and entry["at"] == 1]
+        self.assertEqual(at_one, ["hi", "zNext"])
+        starts = {item.task_id: item.start for item in result.placements}
+        self.assertEqual(starts["aNext"], 2)
+
+    def test_successful_backfill_recomputes_exact_shares(self) -> None:
+        # Big-integer twin of the existing re-rank test: after b1 is backfilled queue B jumps from
+        # zero to ~0.5; C sat at 0.5 minus a sub-ulp gap, so the second backfill is c, not b2.
+        # Float shares made B and C equal and the old code took b2.
+        tasks = (
+            task("cRun", cpu=self.HALF - 2, memory=1, queue="C", duration=10),
+            task("head", cpu=self.CAPACITY, memory=self.CAPACITY, priority=5, arrival=1, duration=10),
+            task("b1", cpu=self.HALF - 1, queue="B", arrival=1, duration=1),
+            task("b2", cpu=1, queue="B", arrival=1, duration=1),
+            task("c", cpu=1, queue="C", arrival=1, duration=1),
+        )
+        result = simulate(self.node(), tasks, queue_weights={"B": 1, "C": 1})
+        self.assertEqual(
+            [entry["task"] for entry in result.decisions if entry.get("reason") == "backfill"],
+            ["b1", "c", "b2"],
+        )
+        self.assertTrue(all(item.task_id != "head" or item.start >= 10 for item in result.placements))
+
+    def test_mathematically_equal_shares_fall_back_to_queue_and_id_ties(self) -> None:
+        # A holds 3 units at weight 3, Z holds 1 unit at weight 1: the weighted shares are exactly
+        # 1/C both. Binary doubles disagree (3/C/3 rounds to 1.0000...01e-20), which used to promote
+        # Z wrongly; exact equality must defer to the queue-name tie-break, serving A first.
+        tasks = (
+            task("aRun", cpu=3, memory=1, queue="A", duration=10),
+            task("zRun", cpu=1, memory=1, queue="Z", duration=10),
+            task("a1", cpu=1, queue="A", arrival=1),
+            task("z1", cpu=1, queue="Z", arrival=1),
+        )
+        result = simulate(self.node(), tasks, queue_weights={"A": 3, "Z": 1})
+        at_one = [entry["task"] for entry in result.decisions if "node" in entry and entry["at"] == 1]
+        self.assertEqual(at_one, ["a1", "z1"])
+        self.assertEqual({entry["weightedDominantShare"] for entry in result.decisions if entry.get("at") == 1}, {0.0})
+
+    def test_large_integer_weights_are_compared_exactly(self) -> None:
+        # Equal usage, weights 10**18 versus 10**18 + 1: weighted shares coincide as doubles but not
+        # as rationals, so the slightly heavier queue Z must go first.
+        tasks = (
+            task("aRun", cpu=self.HALF - 1, memory=1, queue="A", duration=10),
+            task("zRun", cpu=self.HALF - 1, memory=1, queue="Z", duration=10),
+            task("a1", cpu=1, queue="A", arrival=1),
+            task("z1", cpu=1, queue="Z", arrival=1),
+        )
+        weights = {"A": 10**18, "Z": 10**18 + 1}
+        result = simulate(self.node(), tasks, queue_weights=weights)
+        at_one = [entry["task"] for entry in result.decisions if "node" in entry and entry["at"] == 1]
+        self.assertEqual(at_one, ["z1", "a1"])
+        z_decision = next(entry for entry in result.decisions if entry["task"] == "z1")
+        self.assertEqual(z_decision["weight"], 10**18 + 1)
+        self.assertTrue(replay(self.node(), tasks, queue_weights=weights)["identical"])
+
+    def test_zero_capacity_resource_contributes_zero_without_dividing_by_it(self) -> None:
+        # Pure-memory cluster mirrors the CPU scenario through the memory fraction.
+        memory_node = (Node("n1", Resources(0, self.CAPACITY)),)
+        tasks = (
+            task("qRun", cpu=0, memory=self.HALF - 2, queue="Q", duration=10),
+            task("rRun", cpu=0, memory=self.HALF - 3, queue="R", duration=10),
+            task("r1", cpu=0, memory=1, queue="R", arrival=1),
+            task("q1", cpu=0, memory=1, queue="Q", arrival=1),
+            task("r2", cpu=0, memory=1, queue="R", arrival=1),
+            task("q2", cpu=0, memory=1, queue="Q", arrival=1),
+        )
+        result = simulate(memory_node, tasks, queue_weights={"Q": 1, "R": 1})
+        at_one = [entry["task"] for entry in result.decisions if "node" in entry and entry["at"] == 1]
+        self.assertEqual(at_one, ["r1", "q1", "r2", "q2"])
+        self.assertTrue(replay(memory_node, tasks, queue_weights={"Q": 1, "R": 1})["identical"])
+        # A cluster with zero capacity of everything raises nothing: shares stay zero and the task
+        # is simply left unplaced.
+        dead = (Node("n0", Resources(0, 0)),)
+        stuck = simulate(dead, (task("s", cpu=1, queue="S"),), queue_weights={"S": 1})
+        self.assertEqual(stuck.unplaced, ["s"])
+        self.assertEqual(stuck.metrics["queues"]["S"]["dominantShare"], 0.0)
+
+    def test_dominant_share_metric_is_a_six_decimal_float(self) -> None:
+        tasks = (
+            task("aRun", cpu=self.HALF - 2, memory=1, queue="A", duration=10),
+            task("zRun", cpu=self.HALF - 3, memory=1, queue="Z", duration=10),
+            task("z1", cpu=1, queue="Z", arrival=1),
+            task("a1", cpu=1, queue="A", arrival=1),
+        )
+        result = simulate(self.node(), tasks, queue_weights={"A": 1, "Z": 1})
+        share = result.metrics["queues"]["A"]["dominantShare"]
+        self.assertIsInstance(share, float)
+        self.assertEqual(share, 0.5)
+        self.assertEqual(result.metrics["queues"]["A"]["placed"], 2)
+        self.assertEqual(result.metrics["queues"]["A"]["unplaced"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

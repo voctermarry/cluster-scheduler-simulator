@@ -11,12 +11,16 @@ exactly once per placement, tracked by index.
 With ``queue_weights`` supplied the run is in fair-share mode: priorities still order the waiting
 list, but tasks of equal priority are picked from the queue with the smallest weighted dominant
 share -- max(used CPU / total CPU, used memory / total memory) / weight -- and shares are
-recomputed after every release, placement and preemption. Without that mapping, nothing changes.
+recomputed after every release, placement and preemption. Shares are kept as exact rational
+ratios (``Fraction``), so ordering never loses precision on large integer capacities; the value
+is rounded to six decimals only when it leaves the simulator in a trace or metric document.
+Without that mapping, nothing changes.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from fractions import Fraction
 
 from .errors import ValidationError
 from .model import Cluster, Node, Placement, Resources, Task
@@ -93,24 +97,27 @@ class Simulation:
         assert self.queue_weights is not None
         return self.queue_weights.get(queue, 1)
 
-    def _shares(self, clock: int) -> dict[str, float]:
+    def _shares(self, clock: int) -> dict[str, Fraction]:
         """Weighted dominant share of every queue from the tasks running at ``clock``.
 
         The dominant resource is the larger of the queue's CPU and memory fractions of total cluster
         capacity; dividing by the queue weight yields its weighted dominant share. Shares are exact
-        ratios for ordering and are rounded only when they enter a trace document.
+        rational ratios built from the integer inputs, so two shares that differ by less than one
+        binary floating-point ulp still order correctly -- the ratio is rounded to six decimals only
+        when it is written into a trace or metric document. A resource with zero total capacity
+        contributes a zero fraction (never a division by zero).
         """
         assert self.queue_weights is not None
         running = self._active(clock)
         used: dict[str, Resources] = {}
         for item in running:
-            queue = self.task_index[item.task_id].queue
-            used[queue] = used.get(queue, Resources(0, 0)).plus(self.task_index[item.task_id].request)
+            task = self.task_index[item.task_id]
+            used[task.queue] = used.get(task.queue, Resources(0, 0)).plus(task.request)
         capacity = self._cluster.total_capacity()
-        shares: dict[str, float] = {}
+        shares: dict[str, Fraction] = {}
         for queue, request in used.items():
-            cpu_fraction = request.cpu / capacity.cpu if capacity.cpu else 0.0
-            memory_fraction = request.memory / capacity.memory if capacity.memory else 0.0
+            cpu_fraction = Fraction(request.cpu, capacity.cpu) if capacity.cpu else Fraction(0)
+            memory_fraction = Fraction(request.memory, capacity.memory) if capacity.memory else Fraction(0)
             shares[queue] = max(cpu_fraction, memory_fraction) / self._weight(queue)
         return shares
 
@@ -122,7 +129,7 @@ class Simulation:
             pending,
             key=lambda task: (
                 -task.priority,
-                shares.get(task.queue, 0.0),
+                shares.get(task.queue, Fraction(0)),
                 task.arrival,
                 task.queue,
                 task.id,
@@ -275,7 +282,7 @@ class Simulation:
         return {
             "queue": task.queue,
             "weight": self._weight(task.queue),
-            "weightedDominantShare": round(shares.get(task.queue, 0.0), 6),
+            "weightedDominantShare": round(float(shares.get(task.queue, Fraction(0))), 6),
         }
 
     def _annotate(self, document: dict[str, object], context: dict[str, object]) -> dict[str, object]:

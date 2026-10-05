@@ -285,6 +285,73 @@ class CLITests(unittest.TestCase):
         self.assertEqual(document["error"], "validation_error")
         self.assertEqual(document["line"], 1)
 
+    def test_big_integer_inputs_order_by_exact_share_everywhere(self) -> None:
+        # 1e20 capacity: queue Z's anchor holds one unit fewer than A's, a difference no binary
+        # double can represent at 0.5. The exact ordering must serve z1 before a1 through every
+        # public entry point, while the displayed share stays the rounded float 0.5.
+        big = 10**20
+        half = big // 2
+        cluster = self.write(
+            "big_cluster.jsonl", [{"id": "n1", "cpu": big, "memory": big}]
+        )
+        rows = [
+            {"id": "aRun", "cpu": half - 2, "memory": 1, "queue": "A", "duration": 10},
+            {"id": "zRun", "cpu": half - 3, "memory": 1, "queue": "Z", "duration": 10},
+            {"id": "z1", "cpu": 1, "queue": "Z", "arrival": 1},
+            {"id": "a1", "cpu": 1, "queue": "A", "arrival": 1},
+            {"id": "z2", "cpu": 1, "queue": "Z", "arrival": 1},
+            {"id": "a2", "cpu": 1, "queue": "A", "arrival": 1},
+        ]
+        tasks = self.write("big_tasks.jsonl", rows)
+        weights = self.write_weights(
+            [{"queue": "A", "weight": 1}, {"queue": "Z", "weight": 1}], "big_weights.jsonl"
+        )
+        # simulate: every task is placed; placement documents are sorted by (start, task id), so
+        # the scheduling order itself is asserted through `trace` below.
+        code, out, err = run_cli(["simulate", "--cluster", cluster, "--tasks", tasks, "--queue-weights", weights])
+        self.assertEqual((code, err), (EXIT_OK, ""))
+        document = json.loads(out)
+        self.assertEqual(document["unplaced"], [])
+        self.assertEqual([p["task"] for p in document["placements"] if p["start"] == 1], ["a1", "a2", "z1", "z2"])
+
+        # trace: decisions carry a six-decimal float that displays identically for both queues
+        code, out, _ = run_cli(["trace", "--cluster", cluster, "--tasks", tasks, "--queue-weights", weights])
+        self.assertEqual(code, EXIT_OK)
+        decisions = json.loads(out)["decisions"]
+        self.assertEqual([d["task"] for d in decisions if d.get("at") == 1 and "node" in d], ["z1", "a1", "z2", "a2"])
+        for decision in decisions:
+            if decision.get("at") == 1:
+                self.assertIsInstance(decision["weightedDominantShare"], float)
+        self.assertEqual({d["weightedDominantShare"] for d in decisions if d.get("at") == 1}, {0.5})
+
+        # metrics: exact resource accounting survives, dominantShare remains a rounded JSON number
+        code, out, _ = run_cli(["metrics", "--cluster", cluster, "--tasks", tasks, "--queue-weights", weights])
+        self.assertEqual(code, EXIT_OK)
+        queues = json.loads(out)["metrics"]["queues"]
+        self.assertEqual(list(queues), ["A", "Z"])
+        self.assertEqual(queues["A"]["cpuTime"], (half - 2) * 10 + 2)
+        self.assertEqual(queues["Z"]["cpuTime"], (half - 3) * 10 + 2)
+        self.assertEqual(queues["A"]["dominantShare"], 0.5)
+
+        # policies: both node selectors keep the same queue ordering (node choice is unchanged)
+        code, out, _ = run_cli(["policies", "--cluster", cluster, "--tasks", tasks, "--queue-weights", weights])
+        self.assertEqual(code, EXIT_OK)
+        for entry in json.loads(out)["policies"]:
+            self.assertEqual(entry["unplaced"], 0)
+
+        # replay: the exact ordering is deterministic run to run
+        code, out, _ = run_cli(["replay", "--cluster", cluster, "--tasks", tasks, "--queue-weights", weights])
+        self.assertEqual(code, EXIT_OK)
+        self.assertTrue(json.loads(out)["identical"])
+
+        # best-fit changes only node selection, never the queue order
+        code, out, _ = run_cli(
+            ["trace", "--cluster", cluster, "--tasks", tasks, "--queue-weights", weights, "--policy", "best-fit"]
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual([d["task"] for d in json.loads(out)["decisions"] if d.get("at") == 1 and "node" in d],
+                         ["z1", "a1", "z2", "a2"])
+
     def test_weights_parse_errors_name_the_raw_line(self) -> None:
         tasks = self.write("fairb.jsonl", self.FAIR_TASKS())
         cases = {
